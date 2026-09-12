@@ -1656,6 +1656,9 @@ class BigQmtXtData:
         self._cache_obj = None
         self._quote_session = None          # lazily built WholeQuoteClientSession
         self._quote_session_factory = None  # test hook: returns a session-like object
+        self._l2_session = None
+        self._l2_session_lock = threading.Lock()
+        self._l2_stopping = False
         self._bar_pollers = {}              # seq -> _BarPoller, for K-line periods
         self._bar_poller_lock = threading.Lock()
 
@@ -2534,10 +2537,9 @@ class BigQmtXtData:
         one-shot fetch wearing a subscription's name, which is worse than not
         having it, because it looks like it works (issue #95).
 
-        Ticks ride the whole-quote push channel; a single code is just a
-        one-element code list. K-lines have no server-side push -- the bridge
-        only exposes ContextInfo.subscribe_whole_quote, which carries ticks --
-        so they are polled and emitted when the newest bar changes.
+        Ticks ride the whole-quote push channel. L2 periods use native
+        ContextInfo callbacks over Redis Streams, preserving every batch row.
+        K-lines are polled and emitted when the newest bar changes.
         """
         payload = {
             "stock_code": stock_code,
@@ -2546,6 +2548,15 @@ class BigQmtXtData:
             "end_time": end_time,
             "count": count,
         }
+
+        from .l2_push import L2_PERIODS
+        if str(period).lower() in L2_PERIODS:
+            if start_time or end_time or count not in (0, None):
+                raise ValueError('native L2 subscriptions are live-only; query history separately')
+            session = self._native_l2_session()
+            seq = session.subscribe(stock_code, str(period).lower(), callback)
+            self._record_subscription(seq, payload)
+            return seq
 
         if str(period).lower() in ("tick", "full_tick"):
             session = self._whole_quote_session()
@@ -2587,6 +2598,24 @@ class BigQmtXtData:
         poller.start()
         self._record_subscription(seq, payload)
         return seq
+
+    def _native_l2_session(self):
+        with self._l2_session_lock:
+            if self._l2_stopping:
+                raise RuntimeError('L2 subscriptions are stopping')
+            if self._l2_session is None:
+                if str(getattr(self.client, 'transport_name', 'redis')).lower() not in ('redis', 'default', ''):
+                    raise RuntimeError('native L2 push currently requires Redis transport')
+                from .l2_session import L2ClientSession
+                self._l2_session = L2ClientSession(
+                    lambda method, params: self.client.call(method, params, use_formula=False),
+                    self.client._redis(), self._next_seq)
+            return self._l2_session
+
+    def l2_subscription_status(self):
+        """Local continuity/heartbeat diagnostics; no market or account queries."""
+        session = self._l2_session
+        return session.status() if session is not None else []
 
     def _bar_poll_interval_seconds(self):
         config = dict(getattr(self.client, "full_tick_cache_config", {}) or {})
@@ -2760,6 +2789,10 @@ class BigQmtXtData:
         return snapshot
 
     def unsubscribe_quote(self, seq):
+        if self._l2_session is not None and self._l2_session.has_subscription(seq):
+            result = self._l2_session.unsubscribe(seq)
+            self._record_subscription(seq, {}, active=False)
+            return result
         # Three kinds of handle now: whole-quote / tick subscriptions owned by
         # the push session, K-line pollers owned here, and legacy seqs that only
         # ever existed as redis bookkeeping.
@@ -2783,12 +2816,26 @@ class BigQmtXtData:
         """Stop every K-line poller this object owns. Daemon threads die with
         the process anyway; this is for tests and for callers that recycle a
         client without exiting."""
+        l2_count = 0
+        with self._l2_session_lock:
+            session = self._l2_session
+            self._l2_stopping = True
+        try:
+            if session is not None:
+                l2_count = len(session.status())
+                session.stop()
+                with self._l2_session_lock:
+                    if self._l2_session is session:
+                        self._l2_session = None
+        finally:
+            with self._l2_session_lock:
+                self._l2_stopping = False
         with self._bar_poller_lock:
             pollers = list(self._bar_pollers.values())
             self._bar_pollers.clear()
         for poller in pollers:
             poller.stop()
-        return len(pollers)
+        return len(pollers) + l2_count
 
     def run(self):
         while True:

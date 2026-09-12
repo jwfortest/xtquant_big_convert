@@ -31,6 +31,7 @@ RPC_REVISION = "20260715-execution-snapshot-v1"
 
 
 READ_METHODS = {
+    "subscribe_l2_quote", "unsubscribe_l2_quote", "l2_keepalive", "l2_subscription_status",
     "ping",
     "get_deployment_info",
     "probe_capabilities",
@@ -134,6 +135,7 @@ QUOTE_SUBSCRIPTION_METHODS = {
 }
 
 LISTENER_DEFERRED_METHODS = {
+    "subscribe_l2_quote", "unsubscribe_l2_quote",
     "sync_positions",
     # Trade-context queries route through QMT's get_trade_detail_data, which
     # returns EMPTY when called from the background RPC thread (it needs the main
@@ -563,6 +565,7 @@ class BigQmtRpcHandlers:
         order_settle_timeout_seconds=3.0,
         quote_subscription_manager=None,
         default_strategy_name=None,
+        l2_subscription_manager=None,
     ):
         # What an order carries when the caller names no strategy. It is not
         # internal: QMT puts it in the 委托 list's 报单来源 column, so every
@@ -581,6 +584,7 @@ class BigQmtRpcHandlers:
         self.position_sync_sink = position_sync_sink
         self.allow_order_methods = bool(allow_order_methods)
         self.quote_subscription_manager = quote_subscription_manager
+        self.l2_subscription_manager = l2_subscription_manager
         # QMT runtime-injected global functions (passorder/get_trade_detail_data/
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
@@ -669,6 +673,29 @@ class BigQmtRpcHandlers:
         elif handler is None:
             raise ValueError("rpc method is not implemented: %s" % requested_method)
         return handler(params)
+
+    def _require_l2_manager(self):
+        if self.l2_subscription_manager is None:
+            raise RuntimeError('native L2 push is unavailable; enable quote_push.l2 on a Redis server')
+        return self.l2_subscription_manager
+
+    def _handle_subscribe_l2_quote(self, params):
+        return self._require_l2_manager().subscribe(params.get('client_id'),
+            params.get('sub_id'), params.get('stock_code'), params.get('period'))
+
+    def _handle_unsubscribe_l2_quote(self, params):
+        self._require_l2_manager().unsubscribe(params.get('client_id'), params.get('sub_id'))
+        return {}
+
+    def _handle_l2_keepalive(self, params):
+        ids = params.get('sub_ids')
+        if not isinstance(ids, list) or len(ids) > 4096:
+            raise ValueError('sub_ids must be a bounded list')
+        manager = self._require_l2_manager()
+        return {'subscriptions': {str(sid): manager.keepalive(params.get('client_id'), sid) for sid in ids}}
+
+    def _handle_l2_subscription_status(self, params):
+        return self._require_l2_manager().status()
 
     def _handle_ping(self, params):
         return {

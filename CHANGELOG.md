@@ -2,6 +2,12 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased - fork] - 2026-09-12
+
+- Redis L2 订阅从 K 线轮询中分离，使用 QMT 原生 `subscribe_quote` 回调、有界异步发送队列和 Redis Stream，保留整批逐笔与原始整数时间戳。
+- 增加股票/周期共享订阅、批量续约、退订清理、传输序号及故障锁定；溢出、缺口、服务端重启和回调异常明确报告，不回退快照或静默续接。
+- 普通 tick/full_tick 和 K 线路径保持不变。新增只读 QMT 验证入口准备工具、有界六路观察客户端及 [验收说明](docs/L2_REALTIME_PUSH.md)。合成与跨版本验证不代表真实盘中性能通过。
+
 
 ## [0.3.37] - 2026-09-11
 

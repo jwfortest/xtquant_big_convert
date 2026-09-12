@@ -8,6 +8,8 @@
 
 支持 **Redis / ZMQ / 命名管道 / MySQL / 共享内存** 五种可插拔传输，切换只需改一个配置字段。
 
+本 fork 的 `codex/l2-realtime-push` 分支新增 **Redis 模式 L2 原生回调推送**，逐笔成交/委托不再走三秒轮询。需同时升级客户端与 QMT 服务端；配置、连续性保护及独立验证见 [L2 实时推送说明](docs/L2_REALTIME_PUSH.md)。真实盘中性能尚需验收。
+
 已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
 
 另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（47 个子命令）直接查行情、算期权 Greeks、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。

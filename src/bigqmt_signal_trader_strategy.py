@@ -136,6 +136,7 @@ _adjust_logged = False
 _credit_callback_fired = 0
 _rpc_service = None
 _quote_subscription_service = None  # (QuoteSubscriptionManager, QuotePushChannel)
+_l2_subscription_manager = None
 _exec_event_redis_client = None  # reused; building a new client per trade callback leaks
 _scheduled_adjust = False
 # Latency tuning / diagnostics (server side, in the Big QMT process).
@@ -386,6 +387,7 @@ def _perform_reload(context_info):
 
 
 def reset_app():
+    global _l2_subscription_manager
     global _adjust_logged, _rpc_service, _scheduled_adjust, _last_full_tick_refresh_at, _last_full_tick_market_refresh_at
     global _quote_subscription_service, _exec_event_redis_client
     _adjust_logged = False
@@ -399,6 +401,9 @@ def reset_app():
         except Exception:
             pass
     _rpc_service = None
+    if _l2_subscription_manager is not None:
+        _l2_subscription_manager.stop()
+        _l2_subscription_manager = None
     # Stop the quote-push channel + unsubscribe big-QMT whole-quote subs. Without
     # this a strategy re-run leaks the PUB port (next run's start_publisher hits
     # EADDRINUSE, silently dropping quotes forever) and leaves stale QMT
@@ -726,6 +731,17 @@ def _build_rpc_service(context_info, app, config):
     quote_manager = (
         _quote_subscription_service[0] if _quote_subscription_service is not None else None
     )
+    global _l2_subscription_manager
+    quote_config = dict(config.get('quote_push') or {})
+    l2_config = dict(quote_config.get('l2') or {})
+    l2_enabled = _config_bool(l2_config.pop('enabled', None), True)
+    if redis_transport and _config_bool(quote_config.get('enabled'), True) and l2_enabled:
+        if _load_bridge_module is not None:
+            l2_module = _load_bridge_module('bigqmt_signal_trader.l2_push')
+        else:
+            from bigqmt_signal_trader import l2_push as l2_module
+        _l2_subscription_manager = l2_module.L2SubscriptionManager(
+            context_info, response_redis_client or redis_client, account_id, **l2_config)
     handlers = BigQmtRpcHandlers(
         account_id=account_id,
         market_data=BigQmtMarketDataProvider(context_info, qmt_api=qmt_api),
@@ -744,6 +760,7 @@ def _build_rpc_service(context_info, app, config):
         settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
         order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
         quote_subscription_manager=quote_manager,
+        l2_subscription_manager=_l2_subscription_manager,
         # .get(key) not .get(key, default): "" is a real answer here (leave
         # 报单来源 blank), and a default would swallow it -- issue #154.
         default_strategy_name=rpc_config.get("default_strategy_name"),
@@ -871,6 +888,11 @@ def _drain_rpc_service(config):
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)
     processed += _rpc_service.drain_pending(max_items=max_items)
+    if _l2_subscription_manager is not None:
+        try:
+            _l2_subscription_manager.reap_expired()
+        except Exception as exc:
+            _log_err('l2_push', 'reap failed: %s' % exc)
     if _quote_subscription_service is not None:
         try:
             _quote_subscription_service[0].reap_expired()

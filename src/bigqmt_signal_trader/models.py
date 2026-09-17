@@ -300,9 +300,11 @@ class AssetSnapshot:
     and None means "the terminal did not report it" — distinct from 0.0.
     """
 
-    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None):
+    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None, fetch_balance=None):
         self.account_id = account_id
         self.cash = cash
+        # Withdrawable funds; None means unreported, not zero or available cash.
+        self.fetch_balance = fetch_balance
         self.total_asset = total_asset
         self.frozen_cash = frozen_cash
         self.market_value = market_value

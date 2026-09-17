@@ -20,11 +20,7 @@
 
 ### 讨论组：微信群「qmt 交流群」
 
-**群人数已超过 200，微信不再支持扫码进群，需要手动拉。** 扫下面这张加我，我拉你进去：
-
-<img src="docs/assets/wechat-contact-qr.jpg" alt="加作者微信，手动拉进 qmt 交流群" width="320">
-
-> 加好友时备注一下「qmt」，方便我认出来。这张是个人二维码，不会过期。
+**群人数快满 500 人了，不再加新成员，感谢理解。** 群里沉淀了不少踩坑讨论，但检索不到 —— 所以：
 
 提 bug 和功能请求请走 [issue](https://github.com/litaolemo/xtquant_big_convert/issues)：群里的讨论不会被检索到，而 issue 会 —— 下一个遇到同样问题的人能搜到。
 
@@ -40,37 +36,41 @@
 
 ### 配置向导：`bigqmt-init`
 
-不想手动抄两份 `.example.py`、也不想搞清楚三十来个键里哪些真的要改，直接跑：
+部署流程见 [docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md)，向导是它的**第 2 步**：替代手抄两份 `.example.py`。在能写到 QMT 的 python 目录的机器上跑：
 
 ```bash
 bigqmt-init
 ```
 
-或者从源码检出运行：
+`bigqmt-init` 找不到、或者用的是源码检出，等价写法：
 
 ```bash
 python -m bigqmt_signal_trader.init_config
 ```
 
-问几个问题——资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式——然后把配置写出来：
+只能在终端里交互着答，不能用管道喂——密码那一问走 `getpass` 读终端。
 
-| 文件 | 位置 | 作用 |
+问资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式、两个目录，然后把服务端和客户端两份配置由**同一组答案**写出来，连接参数不会对不上：
+
+| 文件 | 写到哪 | 谁用 |
 |---|---|---|
-| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端（QMT 内） |
-| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端（外部程序） |
-| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 选了单文件部署时，配置已烘焙进去 |
+| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端 |
+| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端 |
+| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 只有选了单文件部署才生成，配置已烘焙进去 |
 
-服务端和客户端两份配置由同一组答案生成，**连接参数不会对不上**。
+**它不做的事，也是最容易误解的地方：** 默认的 `package` 部署方式下它**只写配置，不拷包**。跑完打印的「把 src/ 下的包同步到 QMT 的 python 目录」是对源码检出说的；pip 装的没有 `src/`，按快速开始第 3 步找到包的位置再拷 4 项。单文件模式则已经生成到位。
 
-几个不问、直接定死的选项：
+**最容易答错的一问：**「QMT 的 python 目录（回车则写到当前目录）」。这里填 QMT 安装目录下的 `python`，直接回车会写到你当前所在的目录，服务端启动时找不到配置。
 
-- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）—— 选反了差 4~37 倍，向导按你选的传输定，不问
-- **`rpc_allow_order_methods` 默认 `False`** —— 打开前会明确提示：任何能连上这条通道的程序都可以下单
+几个不问、直接定死的：
+
+- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）——选反了差 4~37 倍
+- **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
 已存在的文件会先问再覆盖（`--force` 跳过询问）。
 
-> **密码分两类。** Redis 密码是服务凭据，写进配置文件（`.example.py` 本来就是这么记的），输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里，`bigqmt-init` 沿用这个约定。
+> **密码分两类。** Redis 密码是服务凭据，写进配置文件，输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里。
 >
 > 生成的文件带账号和凭据，**不要提交到版本库**。
 
@@ -659,9 +659,15 @@ pymongo 的 `bson`，两者输出实测逐字节一致），客户端不需要�
 大 QMT 基本每天早上要重启一次，卡点在登录框。两条路绕过它：
 
 > **也可以干脆不重启**（issue #276，@pujfei）：QMT 设置里的「启用自动初始化」
-> 取消勾选后，终端不再每天自动重启策略，可长期不重启运行，功能不受影响。
+> 取消勾选后，终端不再每天自动重启策略，可长期不重启运行。
 > 不重启的部署仍然要注意：升级桥代码后必须手动重启策略（QMT 跨运行保留
-> `sys.modules`，光拷文件不生效）。下面是程序化启停的方案。
+> `sys.modules`，光拷文件不生效）。
+>
+> **但不是每台终端都撑得住长期不重启**（issue #309，国金 1.0.0.37973）：有部署在
+> 取消勾选后大 QMT 的持仓不再刷新——是终端的行情连接掉了，桥本身没坏。两条路：
+> 在 QMT 的「行情源」对话框底部把**交易中心自动更换服务器**和**自动优选**勾上，
+> 让终端断线后自己换站点；或者干脆保留每天早上定时重启（下面
+> `qmt_launcher restart` 就是干这个的）。下面是程序化启停的方案。
 
 > **依赖**：进程枚举优先用 `psutil`；Win11 起系统不再带 `wmic`，没有 psutil 时
 > `close_qmt`/`status` 会直接报 `cannot enumerate processes`（issue #128）。
@@ -878,28 +884,72 @@ xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
 
 ### 多账号使用（股票+期货 / 普通+信用）
 
-当前架构是**单账号单实例**——一个 QMT 策略进程绑定一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号场景（如股票+期货、普通+信用账户同时交易）的推荐方案是**在 QMT 里跑多个策略实例**，每个实例绑一个账号。
+两种方式。**同一个 QMT 客户端里登录了多个资金账号**（比如股票户加期货户）用方式一，一个策略实例同时服务它们；账号分属**不同客户端**（不同券商、不同机器）只能用方式二。
 
-#### 方案：多策略实例（推荐，不改代码）
+RPC channel 都按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`），客户端连哪个账号就填哪个 `account_id`，两种方式对客户端代码没有区别。
 
-**服务端（QMT 内）**：为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+#### 方式一：单实例双账号（`BIGQMT_ACCOUNT_TYPE_MAP`）
+
+一个策略实例、每个账号一条 channel、共用同一套 QMT 句柄。服务端配置在单账号的基础上**多一张路由表**，其余不变：
+
+```python
+# bigqmt_signal_trader_local_config.py —— 单终端双账号：STOCK + FUTURE
+
+# 主账号：策略在 QMT 里以哪个账号加载运行，这里就填哪个。
+# 它的 channel 跑在 adjust 主线程上，所有账号的交易类请求最终都在这里执行。
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
+# 路由表：key=account_id，value=account_type（STOCK / CREDIT / FUTURE / STOCK_OPTION）。
+# 主账号也要在表里。表里除主账号外的每个 key 各起一个 secondary service，
+# 各有自己的 channel（bigqmt:rpc:req:{那个账号}）。
+# 每次请求按其 account_id 查这张表决定 account_type，再传给 QMT API。
+BIGQMT_ACCOUNT_TYPE_MAP = {
+    "你的股票账号": "STOCK",
+    "你的期货账号": "FUTURE",
+}
+
+BIGQMT_REDIS_CONFIG = {
+    "transport": "redis",
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "account_id": BIGQMT_ACCOUNT_ID,
+    "rpc_allow_order_methods": True,      # 对这个实例上的所有账号一起生效
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "500nMilliSecond",
+}
+```
+
+几点说明：
+
+- **只有 `BIGQMT_ACCOUNT_TYPE_MAP` 是桥读的键**。副账号不需要单独的变量，表里有它就够了；表为空或只有一条时，`build_multi_account_rpc_service` 原样返回单账号 service，行为零变化。
+- **`bigqmt-init` 只问一个账号**，生成的是单账号配置。双账号要在生成的文件里手工加 `BIGQMT_ACCOUNT_TYPE_MAP`。
+- **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
+- **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
+- **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
+
+#### 方式二：多策略实例（不改代码，账号在不同客户端时的唯一选择）
+
+为每个账号创建一个独立的配置文件和 DRYRUN 入口。
 
 ```python
 # bigqmt_signal_trader_local_config_stock.py  — 股票账号
 BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",          # 或 "zmq"
-    "account_type": "STOCK",       # 股票
     # ...
 }
 
 # bigqmt_signal_trader_local_config_credit.py  — 信用账号
 BIGQMT_ACCOUNT_ID = "你的信用账号"
+BIGQMT_ACCOUNT_TYPE = "CREDIT"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",
-    "account_type": "CREDIT",      # 信用（两融）
     # ...
 }
 ```
@@ -1145,29 +1195,65 @@ BIGQMT_REDIS_CONFIG = {
 
 ## 快速开始
 
-> 第一次部署、只想要最短路径？直接看 [docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md)（单账号五步跑通 + 常见问题表）。
-
-> 前置：客户端已按上面「A. 客户端」装好包；服务端按「B. 服务端」装好所选传输的依赖。下面是从零跑通整套流程的步骤。
+> 只想最短路径：[docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md)。下面是同一条路，每一步多了一句「为什么」。
 >
-> 只想把配置生成出来的话，跑 [`bigqmt-init`](#配置向导bigqmt-init) 即可——第 3 步的两份配置它会替你写好，选单文件部署还会顺带把构建也做了。
+> 前置：客户端机器上 Python 3.8~3.13；QMT 已装好 Python 组件（`bin.x64\python.exe` 存在，见上面「B. 服务端」）；用 redis 传输就得有一个能连上的 Redis（见「C. Redis 服务本身」），同机 zmq 免 Redis。
 
-### 第 1 步：同步代码到 QMT 的 python 目录
+### 先看这张表：什么文件放哪、谁放
 
-把以下内容复制到大 QMT 的 `python` 目录（如 `D:\国金证券QMT交易端\python\`）：
+整条链路只有三样东西：**QMT 里的服务端**（一个包 + 三个顶层文件，跑在 QMT 自带的 Python 3.6 里）、**外部的客户端**（pip 装的包，跑在你自己的 Python 里）、**中间的 Redis**（或同机 ZMQ）。两个 Python 互不相通：客户端能 `pip install`，QMT 那个不能（旧 OpenSSL），所以服务端文件靠**拷**。
 
+| 文件 | 放哪 | 谁放 |
+|---|---|---|
+| `bigqmt_signal_trader` 包（客户端用的那份） | 客户端机器的 site-packages | `pip install "xtquant-big-convert[redis]"` |
+| `bigqmt_signal_trader_client_config.py` | 客户端：**和你运行的脚本同一目录** | `bigqmt-init` 第二个目录问题写出（回车 = 当前目录） |
+| `bigqmt_signal_trader/`（整个包目录） | QMT 的 `python` 目录，如 `D:\国金证券QMT交易端\python\` | **你手动拷**，从 pip 装的包目录里 |
+| `bigqmt_signal_trader_strategy.py` | 同上 | 同上 |
+| `bigqmt_signal_trader_redis_rpc_runtime.py` | 同上 | 同上 |
+| `BIGQMT_REDIS_DRYRUN.py`（QMT 里加载的入口；纯 zmq 换 `BIGQMT_ZMQ_DRYRUN.py`） | 同上 | 同上 |
+| `bigqmt_signal_trader_local_config.py` | QMT 的 `python` 目录 | `bigqmt-init` 第一个目录问题写出（**必须手填这个目录**，回车 = 当前目录，服务端就找不到了） |
+
+三件事要记住：
+
+- **`bigqmt-init` 只写两份配置**，不拷包、不装依赖、不会自己去找 QMT 装在哪。
+- **QMT 的 `python` 目录**指 QMT 安装目录下那个叫 `python` 的子目录，不是 `bin.x64`。服务端 4 项文件和服务端配置都放这里。
+- **客户端配置跟着脚本走**，不是放 QMT 目录。它靠 `import bigqmt_signal_trader_client_config` 被找到，脚本同目录最省事（详见第 5 步）。
+
+### 第 1 步：客户端装包
+
+在你写策略的那台电脑上：
+
+```powershell
+pip install "xtquant-big-convert[redis]"
 ```
-src/bigqmt_signal_trader/          （整个核心包，含 transports/）
-src/bigqmt_signal_trader_strategy.py
-src/bigqmt_signal_trader_redis_rpc_runtime.py
-src/BIGQMT_REDIS_DRYRUN.py         （★ Redis/MySQL/SHM 等既有 transport 的 QMT 编辑器入口）
-src/BIGQMT_ZMQ_DRYRUN.py           （★ 同机 ZMQ 专用入口，强制 ZMQ 并记录 bootstrap 异常）
+
+装的是客户端。服务端要拷进 QMT 的那 4 项也在这个包里（第 3 步取出来），所以就算客户端和 QMT 是同一台机器，这步也要做。用 zmq 传输可以不带 `[redis]`；mysql 传输用 `[mysql]`。
+
+### 第 2 步：`bigqmt-init` 生成两份配置
+
+在**能写到 QMT 的 python 目录的机器上**跑（通常就是 QMT 那台）：
+
+```powershell
+bigqmt-init
 ```
 
-> 同机 ZMQ 在 QMT“模型研究”中新建 Python 模型并加载 `BIGQMT_ZMQ_DRYRUN.py`；其它 transport 继续使用 `BIGQMT_REDIS_DRYRUN.py`。ZMQ 入口只复用原入口的加载逻辑，不会创建 Redis client。
->
-> **纯 ZMQ 模式的能力边界**：入口会关闭确实依赖 Redis 的 `download_jobs`（下载任务队列）和 `full_tick_cache`（全市场快照缓存）。`on_stock_order` / `on_stock_trade` / `on_order_error` 执行回报通过 ZMQ PUB 推送，MiniQMT 风格回调可以正常使用，但没有 Redis Stream 的短时回放能力。行情查询、下单/撤单、持仓查询等 RPC 全部正常。
+```powershell
+python -m bigqmt_signal_trader.init_config
+```
 
-### 第 2 步：创建 QMT 端私有配置
+两种写法等价；第一种是 pip 装包时注册的命令，找不到就用第二种。**只能在终端里交互着答，不能用管道喂**——密码那一问走 `getpass` 读终端。
+
+它按顺序问：资金账号、账号类型、传输方式、Redis 地址端口用户名密码（选 redis 才问）、是否允许远程下单、部署方式、然后是**两个目录**：
+
+| 问题 | 写出的文件 | 回车不填 |
+|---|---|---|
+| 「QMT 的 python 目录」 | `bigqmt_signal_trader_local_config.py`（服务端） | 写到**当前目录**——服务端启动找不到配置。**手填**，如 `D:\国金证券QMT交易端\python` |
+| 「客户端配置写到哪个目录」 | `bigqmt_signal_trader_client_config.py`（客户端） | 写到当前目录——如果这里就是你外部脚本所在的目录，回车正好 |
+
+两份由同一组答案生成，账号和连接参数不会对不上。跑完打印「=== 已写入 ===」和两个路径，核对一下路径是不是你想的那两个目录。完整的交互记录和每个问题的说明见 [docs/DEPLOY_QUICKSTART.md 第 2 步](docs/DEPLOY_QUICKSTART.md#第-2-步用-bigqmt-init-生成配置)。
+
+<details>
+<summary>不用向导、手写服务端配置（点开看）</summary>
 
 在 QMT 的 `python` 目录创建 `bigqmt_signal_trader_local_config.py`（**不要提交此文件**）：
 
@@ -1201,51 +1287,45 @@ BIGQMT_REDIS_CONFIG = {
 }
 ```
 
-> **这个开关按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
+> **`rpc_background_threads` 按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
 > redis 用 `True`（3.4ms，`brpop` 唤醒是即时的）；zmq / pipe / mysql 用 `False`
 > 走 adjust drain（zmq 15.8ms），因为它们的后台线程每次都要付跨线程 GIL 交接，
 > 约一个 adjust tick。zmq 配 `True` 是 592.9ms，慢 37 倍。不写这个键则沿用历史
-> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。
+> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。向导按传输替你定好了。
 >
 > 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
 > listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。
 
-### 第 3 步：在 QMT 里运行策略
+客户端那份照 [`src/bigqmt_signal_trader_client_config.example.py`](src/bigqmt_signal_trader_client_config.example.py) 写，账号和连接参数与服务端一致。
 
-同机 ZMQ 使用 `src/BIGQMT_ZMQ_DRYRUN.py`，其它 transport 使用 `src/BIGQMT_REDIS_DRYRUN.py`。两者都是 QMT 编辑器入口；ZMQ 入口会在正常 logger 初始化前失败时把 traceback 写入 `<QMT python>\logs\bigqmt-bootstrap-error.log`。部分券商 QMT 缺少标准 `importlib` 时，统一入口会注册仅包含 `import_module/reload` 的最小兼容模块。
+</details>
 
-#### 这个文件做什么
+### 第 3 步：拷 4 项到 QMT 的 python 目录
 
-它是 QMT 编辑器入口的"外壳"（shell），按顺序做 5 件事：
+先找到 pip 装的包在哪（在装了客户端的那个 Python 里）：
 
-1. **定位 python 目录**：把 QMT 的 `python` 目录加到 `sys.path`，让 `bigqmt_signal_trader` 包能 import。
-2. **reload 模块**：`importlib.reload` 刷新 `redis_common` / `redis_rpc` / `strategy` / `runtime` —— QMT 在编辑器里重跑策略时，进程不退出，reload 确保新代码立即生效。
-3. **注入 Redis 配置**：读 `bigqmt_signal_trader_local_config.py` 里的 `BIGQMT_REDIS_CONFIG`，调 `configure_runtime_redis()`。
-4. **注入账号**：读 `BIGQMT_ACCOUNT_ID`，调 `configure_runtime_account()`。如果配置没给，fallback 用 QMT 全局变量 `account`。
-5. **绑定 QMT 原生 API**：把 QMT 内置的 `passorder` / `cancel` / `get_trade_detail_data` 函数绑进 runtime（用 `try/except NameError` 包住，因为这些名字只在大 QMT 进程内存在）。
-6. **导出 QMT 回调**：`init = _runtime.init` / `handlebar = _runtime.handlebar` / `adjust = _runtime.adjust` 等，让 QMT 能回调到我们的策略逻辑。
-
-#### ⚠️ 硬编码路径（重要）
-
-`BIGQMT_REDIS_DRYRUN.py` 里有**一处写死的 QMT python 目录路径**，作为 `__file__` 找不到时的 fallback：
-
-```python
-def _known_qmt_python_dir():
-    root = "".join(chr(value) for value in (0x56fd, 0x91d1, 0x8bc1, 0x5238))   # 国金证券
-    suffix = "".join(chr(value) for value in (0x4ea4, 0x6613, 0x7aef))          # 交易端
-    return "D:\\" + root + "QMT" + suffix + "\\python"
-    # 解码后 = D:\国金证券QMT交易端\python
+```powershell
+python -c "import bigqmt_signal_trader_strategy as m, os; print(os.path.dirname(m.__file__))"
 ```
 
-- **`chr()` 编码**是为了规避 QMT 用 GBK 保存策略文件时中文乱码（用 Unicode 码点拼出"国金证券交易端"）。
-- **路径优先级**：先用 `__file__` 所在目录（脚本实际位置），找不到才用这个硬编码 fallback。
-- **如果你的 QMT 装在别的路径**（比如 `D:\华泰QMT\python`）：通常不用改，因为 `__file__` 优先。但如果你用 `exec` 方式加载（`__file__` 未定义），需要把 `_known_qmt_python_dir()` 改成你的路径，或直接硬编码：
-  ```python
-  def _known_qmt_python_dir():
-      return r"D:\你的券商QMT\python"
-  ```
+把该目录里这 4 项复制到 QMT 的 `python` 目录（**和第 2 步第一个问题填的是同一个目录**）：
 
-#### 启动成功标志（QMT 输出面板）
+```
+bigqmt_signal_trader/                   整个包目录，含 transports/ 和 adapters/
+bigqmt_signal_trader_strategy.py
+bigqmt_signal_trader_redis_rpc_runtime.py
+BIGQMT_REDIS_DRYRUN.py                  QMT 编辑器里加载的入口
+```
+
+4 项缺一不可：少了包目录报 `No module named bigqmt_signal_trader`，少了入口面板没有任何输出。拷完 QMT 的 `python` 目录里应该同时有这 4 项加第 2 步写的 `bigqmt_signal_trader_local_config.py`，共 5 个名字。
+
+> 同机纯 ZMQ、不想装 redis：多拷一个 `BIGQMT_ZMQ_DRYRUN.py`，第 4 步加载它。它强制 ZMQ、不创建 Redis client，并把 bootstrap 异常写到 `<QMT python>\logs\bigqmt-bootstrap-error.log`。**能力边界**：关闭确实依赖 Redis 的 `download_jobs`（下载任务队列）和 `full_tick_cache`（全市场快照缓存）；`on_stock_order` / `on_stock_trade` / `on_order_error` 回报走 ZMQ PUB 推送，MiniQMT 风格回调正常，但没有 Redis Stream 的短时回放。行情查询、下单/撤单、持仓查询等 RPC 全部正常。
+
+> 源码检出（不是 pip 装）的话，这 4 项在仓库的 `src/` 下，`bigqmt-init` 最后那句「把 src/ 下的包同步到 QMT 的 python 目录」说的就是它。
+
+### 第 4 步：QMT 里运行入口
+
+QMT **模型交易**里新建 Python 模型，加载并运行 `BIGQMT_REDIS_DRYRUN.py`（纯 zmq 是 `BIGQMT_ZMQ_DRYRUN.py`），运行模式切到**实盘**。输出面板看到这几行即成功：
 
 ```
 [bigqmt_shell] reload entry paths=['D:\\国金证券QMT交易端\\python']
@@ -1256,17 +1336,41 @@ def _known_qmt_python_dir():
 [bigqmt_signal_trader] init ok
 ```
 
-> **为什么是 GBK 编码？** QMT 的策略编辑器用本地代码页（中文 Windows 是 GBK）保存文件。文件头 `#coding:gbk` 声明编码，避免 QMT 保存时破坏 UTF-8 内容。源码本身是 ASCII（中文用 `chr()` 拼），所以实际不会乱码。
+两个会让它看起来启动了、其实没起来的坑：在**策略编辑器界面**直接点运行、勾了**「独立 python 进程」**。两种情况下 QMT 不注入任何 API 全局，文件被当普通脚本执行完就结束，`init()` 永远不会调用。面板里 `download globals bound=[]` 是空的就是这个（0.3.8 起入口会直接把这段话打出来，#123）。
 
-> **为什么不直接用 `bigqmt_signal_trader_redis_rpc_runtime.py`？** 那个文件是纯逻辑入口，不包含 reload 和 QMT API 绑定。QMT 编辑器应加载与 transport 对应的外壳：同机 ZMQ 使用 `BIGQMT_ZMQ_DRYRUN.py`，其它 transport 使用 `BIGQMT_REDIS_DRYRUN.py`；不要直接加载 runtime 文件。
+### 第 5 步：客户端验证、调用
 
-### 第 4 步：客户端调用
+在客户端机器上，**先 `cd` 到放 `bigqmt_signal_trader_client_config.py` 的目录**（`python -c` 从当前目录找配置）：
+
+```powershell
+python -c "from bigqmt_signal_trader.xtquant_compat import configure, xtdata; configure(); print(xtdata.get_deployment_info())"
+```
+
+打出 `{'version': '0.3.xx', 'package_dir': 'D:\\...\\python\\bigqmt_signal_trader', 'python_version': '3.6.8', ...}` 就通了——这是**服务端**在跑的版本和目录。再拉一次行情：
+
+```powershell
+python -c "from bigqmt_signal_trader.xtquant_compat import configure, xtdata; configure(); print(xtdata.get_full_tick(['000001.SZ']))"
+```
+
+**客户端配置放哪、怎么被找到：** 客户端是靠 `import bigqmt_signal_trader_client_config` 找它的，
+所以它必须在 `sys.path` 上——最省事是**和你运行的脚本放同一目录**（`python xxx.py` 时脚本
+所在目录自动排在 `sys.path` 最前）；交互式或 `python -c` 时是**当前工作目录**。放在别处就
+把那个目录加进 `PYTHONPATH`，或用环境变量 `BIGQMT_CLIENT_CONFIG_MODULE=<模块名>` 指定。
+
+找不到时会退回 `bigqmt_signal_trader_local_config`（服务端那份）。所以把它放进 QMT 的
+`python` 目录、并从那个目录运行客户端也能跑——但那是碰巧命中回退，读到的是服务端配置，
+换台机器就找不到了。客户端和 QMT 不在同一台机器时，配置只能跟着客户端脚本走。
 
 **方式 A：用兼容层（推荐，旧代码零改动）**
 
-客户端创建配置文件 `bigqmt_signal_trader_client_config.py`（与上面类似但用客户端视角），然后：
+```
+D:\my_strategy\
+├── bigqmt_signal_trader_client_config.py   ← bigqmt-init 写的
+└── run.py                                  ← 你的脚本
+```
 
 ```python
+# run.py
 from bigqmt_signal_trader.xtquant_compat import StockAccount, configure, xt_trader, xtdata
 
 configure()
@@ -1312,6 +1416,45 @@ $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
 from xtquant import xtdata
 ticks = xtdata.get_full_tick(["600000.SH"])  # 走 RPC 到大 QMT
 ```
+
+### 升级
+
+客户端 `pip install -U xtquant-big-convert`；服务端重做第 3 步（拷 4 项、清 `__pycache__`），三个顶层文件没变就 `xt_trader.reload_deployment()` 热更新，变了就重启策略。备份、3.6.8 编译、逐文件比对的完整清单见 [docs/DEPLOY_QUICKSTART.md「升级已有部署」](docs/DEPLOY_QUICKSTART.md#升级已有部署package-模式)。
+
+### 入口文件 `BIGQMT_REDIS_DRYRUN.py` 的细节（排错时再看）
+
+它是 QMT 编辑器入口的「外壳」（shell），按顺序做这几件事：
+
+1. **定位 python 目录**：把 QMT 的 `python` 目录加到 `sys.path`，让 `bigqmt_signal_trader` 包能 import。
+2. **reload 模块**：`importlib.reload` 刷新 `redis_common` / `redis_rpc` / `strategy` / `runtime` —— QMT 在编辑器里重跑策略时，进程不退出，reload 确保新代码立即生效。
+3. **注入 Redis 配置**：读 `bigqmt_signal_trader_local_config.py` 里的 `BIGQMT_REDIS_CONFIG`，调 `configure_runtime_redis()`。
+4. **注入账号**：读 `BIGQMT_ACCOUNT_ID`，调 `configure_runtime_account()`。如果配置没给，fallback 用 QMT 全局变量 `account`。
+5. **绑定 QMT 原生 API**：把 QMT 内置的 `passorder` / `cancel` / `get_trade_detail_data` 函数绑进 runtime（用 `try/except NameError` 包住，因为这些名字只在大 QMT 进程内存在）。
+6. **导出 QMT 回调**：`init = _runtime.init` / `handlebar = _runtime.handlebar` / `adjust = _runtime.adjust` 等，让 QMT 能回调到我们的策略逻辑。
+
+部分券商 QMT 缺少标准 `importlib` 时，入口会注册仅包含 `import_module/reload` 的最小兼容模块。
+
+**硬编码路径：** 文件里有**一处写死的 QMT python 目录路径**，作为 `__file__` 找不到时的 fallback：
+
+```python
+def _known_qmt_python_dir():
+    root = "".join(chr(value) for value in (0x56fd, 0x91d1, 0x8bc1, 0x5238))   # 国金证券
+    suffix = "".join(chr(value) for value in (0x4ea4, 0x6613, 0x7aef))          # 交易端
+    return "D:\\" + root + "QMT" + suffix + "\\python"
+    # 解码后 = D:\国金证券QMT交易端\python
+```
+
+- **`chr()` 编码**是为了规避 QMT 用 GBK 保存策略文件时中文乱码（用 Unicode 码点拼出「国金证券交易端」）。
+- **路径优先级**：先用 `__file__` 所在目录（脚本实际位置），找不到才用这个硬编码 fallback。
+- **如果你的 QMT 装在别的路径**（比如 `D:\华泰QMT\python`）：通常不用改，因为 `__file__` 优先。但如果你用 `exec` 方式加载（`__file__` 未定义），需要把 `_known_qmt_python_dir()` 改成你的路径，或直接硬编码：
+  ```python
+  def _known_qmt_python_dir():
+      return r"D:\你的券商QMT\python"
+  ```
+
+> **为什么是 GBK 编码？** QMT 的策略编辑器用本地代码页（中文 Windows 是 GBK）保存文件。文件头 `#coding:gbk` 声明编码，避免 QMT 保存时破坏 UTF-8 内容。源码本身是 ASCII（中文用 `chr()` 拼），所以实际不会乱码。
+
+> **为什么不直接用 `bigqmt_signal_trader_redis_rpc_runtime.py`？** 那个文件是纯逻辑入口，不包含 reload 和 QMT API 绑定。QMT 编辑器应加载与 transport 对应的外壳：同机 ZMQ 使用 `BIGQMT_ZMQ_DRYRUN.py`，其它 transport 使用 `BIGQMT_REDIS_DRYRUN.py`；不要直接加载 runtime 文件。
 
 ---
 
@@ -1519,6 +1662,7 @@ python test_all_apis.py
 | `RuntimeError: passorder is not available in Big QMT runtime` | QMT 没注入 API 全局 —— 这个文件被当成**普通脚本**执行了 | 加到**模型交易**里运行，别在策略编辑器窗口点运行；检查没勾「独立 python 进程」 |
 | `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
 | `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
+| `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
 
 **最常见的是第一条。** 一句话确认：
 

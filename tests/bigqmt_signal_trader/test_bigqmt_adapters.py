@@ -274,6 +274,25 @@ class BigQmtAdaptersTest(unittest.TestCase):
             BigQmtMarketDataProvider(context).get_ticks([token])
             self.assertEqual(context.asked, [[token]], token)
 
+    def test_option_exchange_tokens_reach_qmt_instead_of_raising(self):
+        """SHO/SZO are native QMT market tokens, not instrument codes.
+
+        The adapter must pass them through so the running terminal can answer
+        whether its build supports whole-option-market snapshots.
+        """
+        class FakeCtx:
+            def __init__(self):
+                self.asked = []
+
+            def get_full_tick(self, codes):
+                self.asked.append(list(codes))
+                return {}
+
+        for token in ("SHO", "SZO"):
+            context = FakeCtx()
+            BigQmtMarketDataProvider(context).get_ticks([token])
+            self.assertEqual(context.asked, [[token]], token)
+
     def test_a_futures_token_is_never_narrowed_to_stocks(self):
         """A futures exchange lists only futures -- the token already says what
         it holds, so there is nothing to narrow and no A-share sector to use."""
@@ -594,16 +613,16 @@ class UnparsableRowIsolationTest(unittest.TestCase):
     def _rows(self):
         return [
             self._Row(m_strInstrumentID="600000", m_strExchangeID="SH",
-                      m_nVolume=100, m_nCanUseVolume=100,
+                      m_nVolume=100, m_nCanUseVolume=100, m_nYesterdayVolume=100,
                       m_nVolumeTotalOriginal=100, m_nVolumeTraded=0,
                       m_strTradeID="t1", m_nVolume_deal=1),
             # Counter-style display ID -- _full_code raises on this one.
             self._Row(m_strInstrumentID="rb2401", m_strExchangeID="SHFE",
-                      m_nVolume=1, m_nCanUseVolume=1,
+                      m_nVolume=1, m_nCanUseVolume=1, m_nYesterdayVolume=1,
                       m_nVolumeTotalOriginal=1, m_nVolumeTraded=0,
                       m_strTradeID="t2"),
             self._Row(m_strInstrumentID="000001", m_strExchangeID="SZ",
-                      m_nVolume=200, m_nCanUseVolume=200,
+                      m_nVolume=200, m_nCanUseVolume=200, m_nYesterdayVolume=200,
                       m_nVolumeTotalOriginal=200, m_nVolumeTraded=0,
                       m_strTradeID="t3"),
         ]

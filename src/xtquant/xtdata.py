@@ -31,6 +31,11 @@ def get_instrumentdetail(stock_code):
     return _compat.xtdata.get_instrumentdetail(stock_code)
 
 
+def get_option_detail_data_batch(stockcodes, timeout_seconds=300.0):
+    return _compat.xtdata.get_option_detail_data_batch(
+        stockcodes, timeout_seconds=timeout_seconds)
+
+
 def get_instrument_type(stock_code, variety_list=None):
     return _compat.xtdata.get_instrument_type(stock_code, variety_list)
 

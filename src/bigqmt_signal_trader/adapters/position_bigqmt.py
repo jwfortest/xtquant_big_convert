@@ -14,6 +14,31 @@ def _attr(obj, names, default=None):
     return default
 
 
+def _required_count(row, names, label, code, account_id):
+    """An integer the terminal must give for a position; a missing one is an
+    error, never a zero (issue #290).
+
+    ``m_nVolume`` / ``m_nCanUseVolume`` / ``m_nYesterdayVolume`` used to go
+    through ``int(_attr(row, names, 0) or 0)``, so a row that lacked the
+    attribute serialised exactly like a row that said 0. A caller could not
+    tell "the terminal did not say how much I hold" from "I hold nothing" --
+    and a strategy that reads 0 as "flat" buys again, one that reads 0 as
+    "nothing sellable" never sells. Reporting the row as unknown is worse
+    than refusing the query: #229/#230 already route a failed native query
+    to the RPC error path (ok=False, error=...) instead of an empty answer,
+    and this is the same class of failure one row down. A native 0 is still
+    a 0; an empty native result is still an empty result.
+    """
+    value = _attr(row, names)
+    if value is None:
+        raise ValueError(
+            "POSITION row for %s (account %s) carries no %s (looked for %s); "
+            "refusing to report 0 for a count the terminal did not give -- a "
+            "missing count and a real zero must not look alike (#290)"
+            % (code, account_id, label, "/".join(names)))
+    return int(value)
+
+
 def _float_or_none(value):
     if value is None:
         return None
@@ -66,7 +91,7 @@ def _report_missing_field(label, row, candidates):
 # POSITION/ORDER/DEAL rows. The same token is appended as the ContextInfo code
 # suffix (a2609.DF, rb2401.SF, 000001.SZ, 00700.HGT).
 # Stock/mutual-fund/HK-Connect markets: case-insensitive, unified via normalize.
-_STOCK_EXCHANGE_TOKENS = frozenset({"SH", "SZ", "BJ", "HK", "HGT", "SGT"})
+_STOCK_EXCHANGE_TOKENS = frozenset({"SH", "SZ", "BJ", "HK", "HGT", "SGT", "SHO", "SZO"})
 # Futures XunTou-short exchange tokens: only concatenate the suffix. The symbol
 # must follow each exchange's canonical naming and is case-sensitive
 # (AP401.ZF upper-case / rb2401.SF lower-case, not interchangeable), so never
@@ -154,11 +179,19 @@ class BigQmtPositionProvider:
             raise RuntimeError("get_trade_detail_data is not available in Big QMT runtime")
         return self.get_trade_detail_data
 
-    def get_positions(self, account_id):
+    def list_positions(self, account_id):
+        """Return every native POSITION row without collapsing by stock code.
+
+        Stock-option accounts can hold a long (rights) and short (obligation)
+        position in the same contract at the same time.  The public
+        ``query_stock_positions`` compatibility API is list-shaped, so both
+        rows must survive conversion even though the legacy provider contract
+        below remains a mapping keyed by stock code.
+        """
         query = self._require_query_func()
         # Let query failures reach the RPC error handler instead of reporting empty positions.
         rows = query(account_id, self._resolve_account_type(account_id), "POSITION") or []
-        positions = {}
+        positions = []
         for row in rows:
             try:
                 code = _full_code(
@@ -168,10 +201,11 @@ class BigQmtPositionProvider:
             except Exception as exc:
                 skip_unparsable_row("POSITION", row, exc)
                 continue
-            positions[code] = PositionSnapshot(
+            positions.append(PositionSnapshot(
                 stock_code=code,
-                volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
-                available=int(_attr(row, ("m_nCanUseVolume", "available", "can_use_volume"), 0) or 0),
+                volume=_required_count(row, ("m_nVolume", "volume"), "volume", code, account_id),
+                available=_required_count(
+                    row, ("m_nCanUseVolume", "available", "can_use_volume"), "available", code, account_id),
                 cost=float(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "cost"), 0.0) or 0.0),
                 stock_name=str(_attr(row, ("m_strInstrumentName", "stock_name"), "") or ""),
                 market_value=_float_or_none(_attr(row, ("m_dMarketValue", "m_dInstrumentValue", "market_value"))),
@@ -179,10 +213,22 @@ class BigQmtPositionProvider:
                 open_price=_float_or_none(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "open_price", "cost"))),
                 frozen_volume=int(_attr(row, ("m_nFrozenVolume", "frozen_volume"), 0) or 0),
                 on_road_volume=int(_attr(row, ("m_nOnRoadVolume", "on_road_volume"), 0) or 0),
-                yesterday_volume=int(_attr(row, ("m_nYesterdayVolume", "yesterday_volume"), 0) or 0),
+                yesterday_volume=_required_count(
+                    row, ("m_nYesterdayVolume", "yesterday_volume"), "yesterday_volume", code, account_id),
                 direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
-            )
+            ))
         return positions
+
+    def get_positions(self, account_id):
+        """Return the legacy stock-code mapping used by the internal app.
+
+        Keep this contract unchanged for existing risk and position-sync
+        callers.  Code that needs every direction must use ``list_positions``.
+        """
+        return {
+            position.stock_code: position
+            for position in self.list_positions(account_id)
+        }
 
     def get_position_statistics(self, account_id):
         query = self._require_query_func()
@@ -273,6 +319,7 @@ class BigQmtPositionProvider:
             return AssetSnapshot(account_id=account_id, cash=None, total_asset=None)
 
         row = rows[0]
+        fetch_balance = _float_or_none(_attr(row, ("m_dFetchBalance", "fetch_balance")))
         cash = _attr(row, ("m_dAvailable", "m_dAvailableCash", "available_cash", "cash"))
         total_asset = _attr(row, ("m_dBalance", "m_dAsset", "total_asset", "asset"))
         frozen_cash = _attr(row, _FROZEN_CASH_FIELDS)
@@ -287,6 +334,7 @@ class BigQmtPositionProvider:
                 market_value -= float(frozen_cash)
         return AssetSnapshot(
             account_id=account_id,
+            fetch_balance=fetch_balance,
             cash=float(cash) if cash is not None else None,
             total_asset=float(total_asset) if total_asset is not None else None,
             frozen_cash=float(frozen_cash) if frozen_cash is not None else None,

@@ -31,6 +31,7 @@ from xtquant.xttype import StockAccount
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
+from .option_order_type import option_order_type
 from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
 from .logging_setup import get_logger
 
@@ -194,6 +195,48 @@ def _bool_value(value, default=False):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _first_set(*values):
+    """The first value that is not None; None if all are."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+class _ClientSetting(object):
+    """One client feature setting: explicit ``redis_config`` first, then the
+    config module's section, then the environment / built-in default -- the
+    order the constructor already promises for host/port/password.
+
+    Issue #289: the three feature blocks each broke that in its own way.
+    ``local_cache`` read the module section first and used the explicit value
+    only as its ``.get`` fallback; ``formula_server`` ``or``-chained the module
+    section ahead of the explicit dict, so any module section discarded the
+    explicit one outright; ``full_tick`` never read ``redis_config`` at all,
+    so its constructor switch did nothing even with no module present.
+
+    ``section`` is what load_client_config hands over: the module's dedicated
+    dict (``BIGQMT_LOCAL_CACHE_CONFIG`` etc.) with the module's own
+    ``BIGQMT_REDIS_CONFIG`` flat keys already folded in. How those two rank
+    against each other inside one file is that function's business and is
+    unchanged here. Flat keys carry the section prefix
+    (``local_cache_enabled``), section keys drop it (``enabled``); a section
+    may also spell the flat key, which the old code accepted, so both are
+    looked up there.
+    """
+
+    def __init__(self, explicit, section):
+        self.explicit = dict(explicit or {})
+        self.section = dict(section or {})
+
+    def get(self, flat_key, section_key):
+        return _first_set(
+            self.explicit.get(flat_key),
+            self.section.get(section_key),
+            self.section.get(flat_key),
+        )
 
 
 def _import_optional_module(module_name):
@@ -641,6 +684,88 @@ def _to_documented_market_data_shape(data, field_list, stock_list, period):
     return out
 
 
+# xtdata.get_divid_factors 的七个权息列（dict.thinktrader.net「除权数据」一节），
+# 顺序就是大 QMT 原生返回里那个 7 元素列表的位置顺序：
+#   dict{毫秒时间戳: [每股红利, 每股送转, 每转赠, 配股, 配股价, 是否股改, 复权系数]}
+DIVID_FACTOR_COLUMNS = ("interest", "stockBonus", "stockGift",
+                        "allotNum", "allotPrice", "gugai", "dr")
+# 官方 frame 的完整列：time（毫秒时间戳）在前，然后是七个权息列，全部 float64。
+DIVID_FRAME_COLUMNS = ("time",) + DIVID_FACTOR_COLUMNS
+
+# 大 QMT 给的除权日毫秒戳是上海时间零点（实测三个样本 (ms/1000 + 8h) % 86400 == 0）。
+# 用固定 +8h 折成 YYYYMMDD，不依赖客户端机器的时区。
+_SHANGHAI_OFFSET_S = 8 * 3600
+
+
+def _divid_day_key(key):
+    """A big-QMT ms timestamp key -> the YYYYMMDD string xtdata indexes by.
+
+    Already-YYYYMMDD keys (8 digits) pass through; anything that is not a
+    plain number is left alone rather than guessed at.
+    """
+    import datetime as _dt
+
+    text = str(key).strip()
+    if len(text) == 8 and text.isdigit():
+        return text
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    seconds = number / 1000.0 if number > 1e11 else number
+    day = _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=seconds + _SHANGHAI_OFFSET_S)
+    return day.strftime("%Y%m%d")
+
+
+def _divid_factors_frame(data):
+    """``dict{ms: [7 values]}`` -> the DataFrame ``xtdata.get_divid_factors`` returns.
+
+    Measured against the real xtdata (``df.info()`` on a live miniQMT):
+
+        Index: 19990823 to 20080707            <- ex-dividend day, YYYYMMDD
+        time, interest, stockBonus, stockGift,
+        allotNum, allotPrice, gugai, dr        <- 8 columns, all float64
+
+    The wire carries big QMT's native shape -- a dict keyed by the day's ms
+    timestamp with a positional 7-list -- so this adds the day index, the
+    ``time`` column (the ms key, as float), the names, and the float64 dtype,
+    the way ``get_market_data_ex`` turns wire records into frames. Passing the
+    dict through as-is made ``df["dr"]`` a KeyError for every caller written
+    against the real xtdata.
+
+    Rows keep the server's order (chronological from the terminal). A value
+    that already comes as a named dict is read by name. Anything that is not
+    a dict passes through untouched, so an error envelope is not turned into
+    an empty frame.
+    """
+    if not isinstance(data, dict):
+        return data
+    import pandas as pd
+
+    columns = list(DIVID_FRAME_COLUMNS)
+    if not data:
+        return pd.DataFrame(columns=columns, dtype="float64")
+    rows = {}
+    for key, value in data.items():
+        try:
+            time_ms = float(key)
+        except (TypeError, ValueError):
+            time_ms = float("nan")
+        if isinstance(value, dict):
+            if value.get("time") is not None:
+                try:
+                    time_ms = float(value["time"])
+                except (TypeError, ValueError):
+                    pass
+            factors = [value.get(name) for name in DIVID_FACTOR_COLUMNS]
+        else:
+            seq = list(value) if isinstance(value, (list, tuple)) else [value]
+            factors = (seq + [None] * len(DIVID_FACTOR_COLUMNS))[:len(DIVID_FACTOR_COLUMNS)]
+        rows[_divid_day_key(key)] = [time_ms] + factors
+    frame = pd.DataFrame.from_dict(rows, orient="index", columns=columns)
+    return frame.astype("float64")
+
+
 def _digits_only(value):
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
@@ -1022,57 +1147,50 @@ class BigQmtRpcClient:
             if config_download_poll is not None
             else _env_float("BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", 0.5)
         )
-        full_tick_cache_config = dict(client_config.get("full_tick_cache_config") or {})
+        # Precedence for the three feature sections below (#289): explicit
+        # redis_config > config module > env / default -- the order
+        # host/port/password already get above.
+        full_tick = _ClientSetting(redis_config, client_config.get("full_tick_cache_config"))
         self.full_tick_cache_config = {
             "enabled": _bool_value(
-                full_tick_cache_config.get("enabled", full_tick_cache_config.get("full_tick_cache_enabled")),
+                full_tick.get("full_tick_cache_enabled", "enabled"),
                 _env_bool("BIGQMT_FULL_TICK_CACHE_ENABLED", False),
             ),
-            "demand_ttl_seconds": float(
-                full_tick_cache_config.get("demand_ttl_seconds")
-                or full_tick_cache_config.get("full_tick_demand_ttl_seconds")
-                or _env_float("BIGQMT_FULL_TICK_DEMAND_TTL_SECONDS", 10.0)
-            ),
-            "cache_ttl_seconds": float(
-                full_tick_cache_config.get("cache_ttl_seconds")
-                or full_tick_cache_config.get("full_tick_cache_ttl_seconds")
-                or _env_float("BIGQMT_FULL_TICK_CACHE_TTL_SECONDS", 10.0)
-            ),
-            "wait_seconds": float(
-                full_tick_cache_config.get("wait_seconds")
-                or full_tick_cache_config.get("full_tick_wait_seconds")
-                or _env_float("BIGQMT_FULL_TICK_WAIT_SECONDS", 3.5)
-            ),
-            "poll_interval_seconds": float(
-                full_tick_cache_config.get("poll_interval_seconds")
-                or full_tick_cache_config.get("full_tick_poll_interval_seconds")
-                or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
-            ),
+            "demand_ttl_seconds": float(_first_set(
+                full_tick.get("full_tick_demand_ttl_seconds", "demand_ttl_seconds"),
+                _env_float("BIGQMT_FULL_TICK_DEMAND_TTL_SECONDS", 10.0))),
+            "cache_ttl_seconds": float(_first_set(
+                full_tick.get("full_tick_cache_ttl_seconds", "cache_ttl_seconds"),
+                _env_float("BIGQMT_FULL_TICK_CACHE_TTL_SECONDS", 10.0))),
+            "wait_seconds": float(_first_set(
+                full_tick.get("full_tick_wait_seconds", "wait_seconds"),
+                _env_float("BIGQMT_FULL_TICK_WAIT_SECONDS", 3.5))),
+            "poll_interval_seconds": float(_first_set(
+                full_tick.get("full_tick_poll_interval_seconds", "poll_interval_seconds"),
+                _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2))),
         }
         # Client-side local market-data cache. get_market_data_ex is cache-through;
         # get_local_data falls back to Big QMT by default so a MiniQMT-style
         # download of raw history can be followed by a read in another
         # adjustment mode. Set fallback_rpc=False only for an explicitly
         # offline, cache-only client.
-        local_cache_config = dict(client_config.get("local_cache_config") or {})
+        local_cache = _ClientSetting(redis_config, client_config.get("local_cache_config"))
         self.local_cache_config = {
             "enabled": _bool_value(
-                local_cache_config.get("enabled", merged_redis_config.get("local_cache_enabled")),
+                local_cache.get("local_cache_enabled", "enabled"),
                 _env_bool("BIGQMT_LOCAL_CACHE_ENABLED", True),
             ),
             "dir": (
-                local_cache_config.get("dir")
-                or merged_redis_config.get("local_cache_dir")
+                local_cache.get("local_cache_dir", "dir")
                 or os.environ.get("BIGQMT_LOCAL_CACHE_DIR")
                 or None
             ),
             "fallback_rpc": _bool_value(
-                local_cache_config.get("fallback_rpc", merged_redis_config.get("local_cache_fallback_rpc")),
+                local_cache.get("local_cache_fallback_rpc", "fallback_rpc"),
                 _env_bool("BIGQMT_LOCAL_CACHE_FALLBACK_RPC", True),
             ),
             "format": str(
-                local_cache_config.get("format")
-                or merged_redis_config.get("local_cache_format")
+                local_cache.get("local_cache_format", "format")
                 or os.environ.get("BIGQMT_LOCAL_CACHE_FORMAT")
                 or "auto"  # parquet if pyarrow is available, else pickle
             ),
@@ -1094,11 +1212,12 @@ class BigQmtRpcClient:
         # answers reference/history reads in ~0.07ms without touching the QMT
         # python thread. Enabled by default; every miss falls back to RPC, so a
         # client that cannot reach it just runs as before.
-        formula_config = dict(
-            client_config.get("formula_server_config")
-            or merged_redis_config.get("formula_server")
-            or {}
-        )
+        # Merge, do not choose: the module's section (redis_config already
+        # folded in by load_client_config) updated by the explicit dict, key
+        # by key (#289). The old or-chain took the module section whole and
+        # never looked at the explicit dict.
+        formula_config = dict(client_config.get("formula_server_config") or {})
+        formula_config.update(redis_config.get("formula_server") or {})
         if "enabled" not in formula_config:
             formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", True)
         self.formula_server_config = formula_config
@@ -1174,7 +1293,15 @@ class BigQmtRpcClient:
                 self._formula_router_instance = _Disabled()
         return self._formula_router_instance
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+    def call_tracked(self, method, params=None, account_id=None, request_id=None,
+                     timeout_seconds=None):
+        """``call`` under a request_id the caller chose, so it can ask the
+        server what became of the request after a timeout (#303)."""
+        return self.call(method, params, account_id=account_id,
+                         timeout_seconds=timeout_seconds, request_id=request_id)
+
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True,
+             request_id=None):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError(_missing_account_id_message())
@@ -1218,11 +1345,14 @@ class BigQmtRpcClient:
             # envelope the same way call_redis_rpc does.
             request = {
                 "schema_version": 1,
-                "request_id": uuid.uuid4().hex,
+                "request_id": str(request_id or uuid.uuid4().hex),
                 "account_id": target_account,
                 "method": method,
                 "params": params or {},
                 "ttl_seconds": 60,
+                # How long we wait. A server that only reaches this request
+                # after that refuses it instead of running it (#303).
+                "timeout_seconds": float(wait_seconds),
             }
             response = transport.send_request(request, wait_seconds)
         else:
@@ -1232,6 +1362,7 @@ class BigQmtRpcClient:
                 method=method,
                 params=params or {},
                 timeout_seconds=wait_seconds,
+                request_id=request_id,
             )
         if not response.get("ok"):
             raise RpcServerRepliedError(
@@ -1489,12 +1620,16 @@ _RESYNTH_NOTICE = {"shown": False}
 
 
 def _in_trading_session(now):
-    """Weekday inside the continuous-auction window (with a settle margin
-    after close). After the close the ongoing multi-day bar is finalized and
-    passes through untouched (#226's after-close control)."""
+    """Weekday inside the day session (auction open through the settle
+    margin after close). The resynth used to start at 09:30, but the
+    zero-volume ongoing bar was measured at 09:26 (#307): the terminal's
+    rescue serves a synthesized period bar right after the auction match,
+    before continuous trading opens. After the close the ongoing multi-day
+    bar is finalized and passes through untouched (#226's after-close
+    control)."""
     if now.weekday() > 4:
         return False
-    return _dt.time(9, 30) <= now.time() <= _dt.time(15, 5)
+    return _dt.time(9, 15) <= now.time() <= _dt.time(15, 5)
 
 
 def _now():
@@ -2078,11 +2213,27 @@ class BigQmtXtData:
         filters the returned rows -- this rebuild is what makes the bridge
         match that.
 
-        Structural triggers only, never a value guess: the period is in
-        RESYNTH_ONGOING_PERIODS, the last bar's natural period contains today,
-        the request window cuts into the period (start_time past its start),
-        and the clock is inside a weekday session -- after close the bar is
-        finalized and passes through untouched.
+        Two result-driven triggers on top of the original #226 window shape
+        (both from #307, measured live on terminal build 2.0.8.300):
+
+        * reconcile -- the last bar IS the ongoing period: its volume is
+          checked against the daily sum of that period, whatever the window
+          shape. The zero-volume form was measured at 09:26 right after the
+          auction match (the rescue's synthesized bar carries no period
+          accumulation) and the partial-days form is the original #226
+          truncation; a window covering the whole period is NO LONGER an
+          exemption, because the covered answer was measured wrong too. A
+          bar that already agrees passes through untouched, so the one
+          extra daily read is the only cost on a healthy terminal.
+        * append -- the last bar is finalized history but the request window
+          covers the current period (start <= its start) and that period has
+          daily bars: the MISSING ongoing bar is appended, synthesized from
+          the dailies. Measured mid-session: the in-session answer simply
+          drops the current period's bar.
+
+        Guards kept: multi-day periods only, an explicit start_time, the
+        clock inside the day session (09:15..15:05), nothing after the close
+        when the bar is finalized.
 
         Degrades like the preClose backfill (#166): a failed or empty daily
         read keeps the terminal's answer and warns once; nothing raises.
@@ -2096,30 +2247,49 @@ class BigQmtXtData:
         if not _in_trading_session(now):
             return data
         today = now.strftime("%Y%m%d")
+        start_day = _digits_only(start_text)[:8]
+        end_day = _digits_only(str(end_time or ""))[:8]
+        current_start = RESYNTH_PERIOD_STARTS[period](today)
+        if current_start is None:
+            return data
+        # A window "covers" the ongoing period only when BOTH ends straddle
+        # it: reading pure history (an end inside a past period) never asked
+        # for the ongoing bar, so appending one there would invent data.
+        covers_current = start_day <= current_start and (
+            not end_day or end_day >= current_start)
 
-        targets = {}
+        reconcile, append = {}, {}
         for code, frame in data.items():
             labels = _frame_bar_labels(frame)
             if not labels:
+                # No rows at all: append when the window covers the period.
+                if covers_current:
+                    append[code] = current_start
                 continue
             label = labels[-1]
             period_start = RESYNTH_PERIOD_STARTS[period](label)
             period_end = _period_end_label(period, label)
             if period_start is None or period_end is None:
                 continue
-            if not (period_start <= today <= period_end):
-                continue          # the last bar is finalized history
-            if _digits_only(start_text)[:8] <= period_start:
-                continue          # the window already covers the period
-            targets[code] = period_start
-        if not targets:
+            if period_start <= today <= period_end:
+                # The ongoing bar itself: reconcile against the daily sum
+                # regardless of the window shape (#307).
+                reconcile[code] = period_start
+                continue
+            if today > period_end and covers_current:
+                # Finalized history where the ongoing bar should also be:
+                # append it from the period's dailies (#307 missing form).
+                append[code] = current_start
+        if not reconcile and not append:
             return data
 
+        wanted = sorted(set(reconcile) | set(append))
+        first = min(reconcile.values()) if reconcile else current_start
         try:
             daily = self.get_market_data_ex(
                 field_list=["open", "high", "low", "close", "volume", "amount"],
-                stock_list=sorted(targets), period="1d",
-                start_time=min(targets.values()), end_time=today, count=-1,
+                stock_list=wanted, period="1d",
+                start_time=first, end_time=today, count=-1,
                 dividend_type=dividend_type, fill_data=False,
                 timeout_seconds=timeout_seconds, use_formula=use_formula,
                 backfill_pre_close=False, resynth_ongoing_multiday=False,
@@ -2130,18 +2300,68 @@ class BigQmtXtData:
             log.warning("ongoing %s bar rebuild skipped: %s", period, exc)
             return data
 
-        rebuilt = 0
-        for code, period_start in targets.items():
+        rebuilt = appended = 0
+        for code, period_start in reconcile.items():
             frame = data.get(code)
             daily_frame = daily.get(code) if isinstance(daily, dict) else None
             summary = self._sum_daily_bars(daily_frame, period_start, today)
             if summary is None:
                 continue
+            if not self._last_bar_disagrees(frame, summary):
+                continue          # already the daily sum: leave it untouched
             if self._write_last_bar(frame, summary):
                 rebuilt += 1
-        if rebuilt:
-            self._notice_resynth_ongoing(period, rebuilt)
+        for code, period_start in append.items():
+            frame = data.get(code)
+            daily_frame = daily.get(code) if isinstance(daily, dict) else None
+            summary = self._sum_daily_bars(daily_frame, period_start, today)
+            if summary is None:
+                continue          # no dailies in the period yet: nothing to add
+            label = _period_end_label(period, period_start)
+            if label is None:
+                continue
+            if self._append_ongoing_bar(frame, label, summary):
+                appended += 1
+        if rebuilt or appended:
+            self._notice_resynth_ongoing(period, rebuilt + appended, appended)
         return data
+
+    @staticmethod
+    def _last_bar_disagrees(frame, summary):
+        """True when the last bar's volume differs from the daily sum.
+
+        Volume is the reconciliation key (#307): every broken form measured
+        so far -- the 09:26 zero-volume rescue bar, the #226 window
+        truncation, a partial-days synthesis -- shows up there. A frame that
+        never asked for the volume column cannot be proved right; reporting
+        disagreement keeps the rebuild as the fallback for those.
+        """
+        try:
+            values = list(frame["volume"])
+        except Exception:
+            return True          # no volume column: cannot prove agreement
+        if not values:
+            return True
+        wanted = summary.get("volume")
+        if wanted is None:
+            return False         # nothing to reconcile against
+        current = _bar_float(values[-1])
+        if current is None:
+            return True
+        return abs(current - wanted) > max(1.0, abs(wanted) * 1e-6)
+
+    @staticmethod
+    def _append_ongoing_bar(frame, label, summary):
+        """Append the missing ongoing bar, only into columns the frame has."""
+        row = {name: value for name, value in summary.items()
+               if value is not None and name in list(frame.columns)}
+        if not row:
+            return False
+        try:
+            frame.loc[label] = row
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _sum_daily_bars(frame, period_start, today):
@@ -2199,18 +2419,19 @@ class BigQmtXtData:
         return wrote
 
     @staticmethod
-    def _notice_resynth_ongoing(period, count):
+    def _notice_resynth_ongoing(period, count, appended=0):
         """Say once that ongoing bars are rebuilt here, not answered by QMT."""
         if _RESYNTH_NOTICE["shown"]:
             return
         _RESYNTH_NOTICE["shown"] = True
         try:
             log.info(
-                "the ongoing %s bar(s) of %d code(s) were rebuilt from the "
-                "period's daily bars (issue #226): big QMT synthesizes them "
-                "from the request window, miniQMT from all local data. Pass "
-                "resynth_ongoing_multiday=False to serve the raw window "
-                "answer.", period, count)
+                "%d ongoing %s bar(s) were reconciled from the period's "
+                "daily bars and %d missing one(s) appended (issues #226 and "
+                "#307): big QMT synthesizes them from the request window or "
+                "drops them mid-session, miniQMT serves the period's "
+                "accumulation. Pass resynth_ongoing_multiday=False to serve "
+                "the raw answer.", count - appended, period, appended)
         except Exception:
             pass
 
@@ -2360,17 +2581,24 @@ class BigQmtXtData:
         dividend_type="none",
         fill_data=True,
         data_dir=None,
+        resynth_ongoing_multiday=True,
     ):
         """Read bars from the CLIENT-side local cache — no RPC to Big QMT.
 
         Returns a dict {code: DataFrame}. A cache-missed code is omitted, unless
         local_cache_fallback_rpc is enabled (then it is fetched + cached over RPC).
+
+        The cache-less RPC branch answers from the terminal's local files and
+        gets the same ongoing multi-day reconciliation get_market_data_ex has
+        (#226/#307): with the cache off this is THE read callers use for
+        trusted local data, and the terminal's synthesized-period answer drops
+        or zeroes the ongoing bar there just the same.
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         cache = self._local_cache()
         if cache is None:
             # Cache disabled -> behave like a plain RPC local-data read.
-            return self._call(
+            data = self._call(
                 "get_local_data",
                 field_list=_as_list(field_list),
                 stock_list=codes,
@@ -2382,6 +2610,24 @@ class BigQmtXtData:
                 fill_data=fill_data,
                 data_dir=data_dir,
             )
+            if (resynth_ongoing_multiday
+                    and str(period or "") in RESYNTH_ONGOING_PERIODS):
+                # The raw local read answers a bare frame for one code and a
+                # {code: frame} dict for several (#307 was reported through
+                # the dict shape); wrap the single-code frame so both get the
+                # same reconciliation, then unwrap.
+                single = None
+                payload = data
+                if not isinstance(data, dict) and codes:
+                    single = codes[0]
+                    payload = {single: data}
+                if isinstance(payload, dict) and payload:
+                    payload = self._resynth_ongoing_multiday_bars(
+                        payload, period=period, start_time=start_time,
+                        end_time=end_time, dividend_type=dividend_type,
+                    )
+                data = payload.get(single) if single is not None else payload
+            return data
         fields = list(field_list or [])
         result = {}
         missing = []
@@ -2842,7 +3088,16 @@ class BigQmtXtData:
             time.sleep(3600)
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
-        return self._call("get_divid_factors", stock_code=stock_code, start_time=start_time, end_time=end_time)
+        """除权除息因子，返回 DataFrame，对齐 ``xtdata.get_divid_factors``。
+
+        行是除权日（毫秒时间戳，同官方保留原始键），列是 ``interest`` /
+        ``stockBonus`` / ``stockGift`` / ``allotNum`` / ``allotPrice`` /
+        ``gugai`` / ``dr``。线上仍是大 QMT 原生的 ``dict{时间戳: [7 个数]}``，
+        走原始 RPC（含 ``getDividFactors`` 别名）拿到的还是那个 dict。
+        """
+        data = self._call("get_divid_factors", stock_code=stock_code,
+                          start_time=start_time, end_time=end_time)
+        return _divid_factors_frame(data)
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
@@ -3023,8 +3278,32 @@ class BigQmtXtData:
         # 签名一致；大 QMT 那边这个调用没有增量参数，服务端按全量下载处理。
         return self._call("download_history_contracts")
 
-    def get_option_list(self, undl_code, dedate, opttype="", isavailavle=False):
-        return self._call("get_option_list", undl_code=undl_code, dedate=dedate, opttype=opttype, isavailavle=isavailavle)
+    def get_option_list(
+        self,
+        undl_code,
+        dedate,
+        opttype="",
+        isavailavle=None,
+        available=None, # fix typo
+    ):
+        if (
+            available is not None
+            and isavailavle is not None
+            and bool(isavailavle) != bool(available)
+        ):
+            raise ValueError("isavailavle and available must not conflict")
+        selected_available = (
+            bool(available)
+            if available is not None
+            else bool(isavailavle) if isavailavle is not None else False
+        )
+        return self._call(
+            "get_option_list",
+            undl_code=undl_code,
+            dedate=dedate,
+            opttype=opttype,
+            isavailavle=selected_available,
+        )
 
     def get_his_option_list(self, undl_code, dedate):
         return self._call("get_his_option_list", undl_code=undl_code, dedate=dedate)
@@ -3265,6 +3544,14 @@ class BigQmtXtData:
 
     def get_option_detail_data(self, stockcode):
         return self._call("get_option_detail_data", stockcode=stockcode)
+
+    def get_option_detail_data_batch(self, stockcodes, timeout_seconds=300.0):
+        """Fetch many option details in one RPC; QMT loops over the codes."""
+        return self.client.call(
+            "get_option_detail_data_batch",
+            {"stockcodes": list(stockcodes)},
+            timeout_seconds=timeout_seconds,
+        ) or {}
 
     def get_option_undl_data(self, undl_code_ref=""):
         return self._call("get_option_undl_data", undl_code_ref=undl_code_ref)
@@ -4177,6 +4464,7 @@ class BigQmtXtTrader:
             and self._account_cache_usable(account_id, "query_stock_asset(empty)") is not None
         ):
             data = self._cached_asset(account_id) or data
+        fetch_balance = _safe_float(data.get("fetch_balance"), None)
         cash = data.get("cash")
         total_asset = data.get("total_asset")
         frozen_cash = data.get("frozen_cash")
@@ -4196,6 +4484,8 @@ class BigQmtXtTrader:
             account_type=self._account_type_value(),
             cash=_safe_float(cash, 0.0) if cash is not None else None,
             available_cash=_safe_float(cash, 0.0) if cash is not None else None,
+            fetch_balance=fetch_balance,
+            m_dFetchBalance=fetch_balance,
             # MiniQMT's XtAsset always exposes frozen_cash, so default to 0.0
             # rather than None: callers do arithmetic on it.
             frozen_cash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
@@ -4616,13 +4906,93 @@ class BigQmtXtTrader:
         }
         if not wait_settlement:
             payload["wait_settlement"] = False
+        tracked = getattr(self.client, "call_tracked", None)
+        if tracked is None:
+            # A client that cannot name its request (a test double): the
+            # pre-#303 contract, where a timeout is honestly unknown.
+            try:
+                return self.client.call("order_stock", payload, account_id=account_id) or {}
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
+                    % (user_order_id, exc)
+                )
+        request_id = uuid.uuid4().hex
         try:
-            return self.client.call("order_stock", payload, account_id=account_id) or {}
+            return tracked("order_stock", payload, account_id=account_id,
+                           request_id=request_id) or {}
         except TimeoutError as exc:
+            return self._order_stock_after_timeout(request_id, account_id, user_order_id, exc)
+
+    # After a timed-out order_stock: how long to keep asking the server what
+    # became of it, and how often. Covers the server's own settlement wait
+    # (order_settle_timeout_seconds, 3s) with room to spare.
+    ORDER_TIMEOUT_FOLLOWUP_SECONDS = 5.0
+    ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS = 0.5
+
+    def _order_stock_after_timeout(self, request_id, account_id, user_order_id, exc):
+        """Turn "timed out, state unknown" into an answer (#303).
+
+        Under a burst the bridge runs orders one at a time, so a request can
+        outlive its caller's patience. The server keeps every order request's
+        outcome for ten minutes, and ``get_request_outcome`` reads it on the
+        listener thread -- reachable even while the adjust thread is busy.
+
+            settled     the reply we missed: return it as if it had arrived
+            refused     past its deadline before dispatch: NOT placed
+            unknown     never picked up: it will be refused when it is (it is
+                        past its deadline), so NOT placed either
+            dispatched  passorder ran, the id is still being looked up: keep
+                        asking for a few seconds, then say so
+
+        A server without the method (older than #303) makes the query fail;
+        that falls through to the old message, which was honest about not
+        knowing.
+        """
+        deadline = time.time() + float(self.ORDER_TIMEOUT_FOLLOWUP_SECONDS)
+        last_state = None
+        while True:
+            try:
+                outcome = self.client.call(
+                    "get_request_outcome", {"request_id": request_id},
+                    account_id=account_id, timeout_seconds=2.0) or {}
+            except Exception:
+                outcome = None
+            if not isinstance(outcome, dict) or "state" not in outcome:
+                break
+            last_state = str(outcome.get("state") or "")
+            if last_state == "settled":
+                response = outcome.get("response") or {}
+                if not response.get("ok"):
+                    raise RpcServerRepliedError(
+                        response.get("error") or "Big QMT RPC failed: order_stock")
+                server_error = str(response.get("server_error") or "")
+                if server_error:
+                    raise RpcServerRepliedError(
+                        "Big QMT order_stock server_error: %s" % server_error)
+                return _restore_jsonable(response.get("data")) or {}
+            if last_state in ("refused", "unknown"):
+                raise TimeoutError(
+                    "order_stock rpc timeout; user_order_id=%s. The bridge did NOT place "
+                    "this order (%s before dispatch): safe to retry, ideally with less "
+                    "concurrency or a longer timeout -- orders run one at a time on the "
+                    "QMT strategy thread. %s"
+                    % (user_order_id,
+                       "refused as expired" if last_state == "refused" else "never picked up",
+                       exc))
+            if time.time() >= deadline:
+                break
+            time.sleep(self.ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS)
+        if last_state in ("dispatched", "dispatching"):
             raise TimeoutError(
-                "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
-                % (user_order_id, exc)
-            )
+                "order_stock rpc timeout; user_order_id=%s. passorder DID run for this "
+                "order but QMT had not assigned its id when we stopped waiting: it is "
+                "live. Find it by remark before retrying, or a retry is a duplicate. %s"
+                % (user_order_id, exc))
+        raise TimeoutError(
+            "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
+            % (user_order_id, exc)
+        )
 
     def _async_order_worker(self):
         """Drain queued async orders; never fires user callbacks itself.
@@ -5641,7 +6011,16 @@ class BigQmtXtTrader:
             params["wait_seconds"] = float(wait_seconds)
         if max_age_seconds is not None:
             params["max_age_seconds"] = float(max_age_seconds)
-        return self.client.call("query_credit_account", params, account_id=account_id)
+        answer = self.client.call("query_credit_account", params, account_id=account_id)
+        # The envelope stays a dict; its rows are the same native credit rows
+        # query_credit_detail returns, and #271 made those attribute-readable
+        # (CompatRow). This path bypassed _query_account_list and was missed,
+        # so ``r["rows"][0].m_dAssureAsset`` raised where the detail path
+        # answered. Same container change, same reason.
+        if isinstance(answer, dict) and isinstance(answer.get("rows"), list):
+            answer = dict(answer)
+            answer["rows"] = [_as_compat_row(row) for row in answer["rows"]]
+        return answer
 
     def query_stk_compacts(self, account):
         return self._query_account_list(account, "query_stk_compacts")
@@ -5949,7 +6328,8 @@ class BigQmtXtTrader:
 
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
-        order_type = _action_to_order_type(action)
+        order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
+                      if self._account_type_value(item) == 6 else _action_to_order_type(action))
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         return CompatObject(
             account_id=account_id,
@@ -5995,7 +6375,8 @@ class BigQmtXtTrader:
 
     def _trade_from_dict(self, account_id, item):
         action = item.get("action")
-        order_type = _action_to_order_type(action)
+        order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
+                      if self._account_type_value(item) == 6 else _action_to_order_type(action))
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
         traded_volume = _safe_int(item.get("volume", item.get("traded_volume")))

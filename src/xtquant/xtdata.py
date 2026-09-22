@@ -5,8 +5,8 @@ def __getattr__(name):
     return getattr(_compat.xtdata, name)
 
 
-def get_full_tick(code_list):
-    return _compat.xtdata.get_full_tick(code_list)
+def get_full_tick(code_list, types=None):
+    return _compat.xtdata.get_full_tick(code_list, types=types)
 
 
 def get_market_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True):

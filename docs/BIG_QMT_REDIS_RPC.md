@@ -383,10 +383,11 @@ QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 
 |---|---|---|---|---|
 | `500nMilliSecond` | ~2.4/s | ~490 / 510ms | 极低 | 默认省电 |
 | `200nMilliSecond` | 折中 | ~200ms 量级 | 中 | **推荐平衡点** |
-| `100nMilliSecond` | ~2150/s(QMT 当"尽快跑"热循环) | ~92 / 108ms | 烧≈1 核 | 尾最低但费 CPU |
+| `100nMilliSecond` | 10/s（稳态；启动后回放窗口里几千/s 是历史 K 线回放，不是这个定时器） | ~92 / 108ms | 低 | 现默认 |
 
-**deferred 交易查询恒定 ~1s**(实测 p50 1012~1013ms,与 interval 无关)—— 瓶颈是
-`get_trade_detail_data` 自身的柜台查询开销,调 interval 无效。要低延迟拿持仓,走**客户端 redis
+**deferred 交易查询的下限是一拍，上限看 `get_trade_detail_data` 自己**：2026-09-04 实测
+p50 1012~1013ms（与 interval 无关），2026-09-22 同一终端 drain 下 103ms —— 差的是柜台查询
+自身的开销（当天委托/成交行数），调 interval 无效。要低延迟拿持仓,走**客户端 redis
 缓存**(position_sync 已在写)而非每次实时查。
 
 ### zmq 真机实测(同机 localhost)
@@ -400,8 +401,25 @@ QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 
 ### 传输与后台线程
 
 - **redis**(默认,跨机):`rpc_process_in_listener=True`。
-- **zmq**(同机低延迟):只加 `transport="zmq"` 一行;非 redis 传输 `_build_rpc_service` 会自动开
-  `background_threads`,端口按账号派生 `tcp://127.0.0.1:1556x`。
+- **zmq**(同机免 Redis):只加 `transport="zmq"` 一行,端口按账号派生 `tcp://127.0.0.1:1556x`。
+- **`rpc_background_threads` 一律 `False`**(adjust drain)。后台收包线程每拿一次 GIL 付一个
+  adjust tick,redis 回包 8 次往返就是 ~400ms(#343);drain 下所有传输都是 ≤1 tick。不写这个
+  键时能 drain 的传输默认就是 drain,只有没有 drain 实现的(shm)保留收包线程。
+- **重读走工作线程**(`rpc_heavy_offload`,默认 `True`,#351)。drain 下所有请求都在 adjust 线程上
+  跑,一次 1.8s 的 `get_market_data_ex` 就是策略自己的 `tick_app` 停 1.8s——这正是 #321 把 LPOP
+  从 adjust 上拿掉的原因。现在按方法(`get_financial_data` / `get_raw_financial_data`、
+  `call_formula` / `gen_factor_index` 等)或按大小(市场令牌的 `get_full_tick`、超过
+  `rpc_heavy_codes_threshold`=20 个代码、`period="tick"`、按日期窗口取 K 线)判定为重的读请求交给
+  一条工作线程,回包由 adjust 线程在下一拍发出(zmq 的 ROUTER socket / 管道句柄不能跨线程用)。
+  重读的往返多付 1~2 拍;轻读和所有交易查询照旧一拍、照旧在 adjust 线程。
+  实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
+  全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口
+  ~500ms，拍 0.100 / 0.27–0.29s；`get_financial_data` 10 只 3 表 ~2.1s，拍 0.100 / ~0.5s——QMT 的
+  C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到一段。`download_history_data2` 5 只 ~1.2s
+  整段持 GIL，拍 0.56–0.63 / 1.3–1.5s，工作线程帮不上、回包还多付一两拍，所以 `download_*` 不列入，
+  照旧 adjust 线程。
+  `probe_capabilities` 的 `thread_routing.heavy_sample` 报每类走哪边。后台线程模式下没有这条线程
+  (收包线程本来就在 adjust 之外跑)。
 - QMT 编辑器可直接加载 `BIGQMT_ZMQ_DRYRUN.py`；该入口强制使用 ZMQ，并复用原有 Bridge 加载逻辑。
 - 内置 Redis 客户端读取含股票代码的原始 JSON 会触发 `Sensitive Data Detected`;客户端 helper 默认
   对请求做安全编码。

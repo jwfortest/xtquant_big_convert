@@ -29,7 +29,7 @@
 
 ### `ping`
 - **参数**：无
-- **返回**：`{"pong": True, "account_id": "...", "server_time": "YYYY-MM-DD HH:MM:SS"}`
+- **返回**：`{"pong": True, "account_id": "...", "account_type": "STOCK", "account_types": ["STOCK", ...], "server_time": "YYYY-MM-DD HH:MM:SS"}`——`account_types` 是这个账号可按哪些类型查（`BIGQMT_ACCOUNT_TYPE` 写成列表时不止一个，港股通）
 - **用途**：探活、确认 RPC 服务在线与归属账号。
 - **实测延迟**：Redis ~13ms（p50）。
 
@@ -367,6 +367,11 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 
 下列方法的 `account_id` 参数均可选（不传则用服务端配置的账号）。也接受 `account`（对象/dict）。
 
+所有交易类方法（本节、第 5 节下单撤单、第 6 节账户扩展查询）还接受可选的 `account_type`
+（`"STOCK"` / `"CREDIT"` / `"FUTURE"` / `"HUGANGTONG"` / `"SHENGANGTONG"` / ...，或 xtconstant 的数字）：
+客户端 `StockAccount(id, "HUGANGTONG")` 的类型就是这样传来的。服务端只在该账号配置允许时按它查
+（`BIGQMT_ACCOUNT_TYPE` 或 `BIGQMT_ACCOUNT_TYPE_MAP` 的值写成列表），否则按配置的默认类型答并记一次日志。
+
 ### `get_asset`
 - **别名**：`query_stock_asset`
 - **参数**：`account_id`(str, 可选)
@@ -508,6 +513,18 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
   - `account_id`(可选) `strategy_name` `signal_id` `remark`/`order_remark`
 - **返回**：`{"order_sys_id":..., "user_order_id":...}`
 - **实现**：`passorder(op_type, combo_type, account, code, price_type, price, volume, ..., quicktrade=2)`。
+- **信用 / 期权类型**：`order_type` 传 MiniQMT 常量即可（`CREDIT_FIN_BUY`=27 融资买入 …
+  `CREDIT_DIRECT_CASH_REPAY`=32 直接还款，专项 40-45 出去时改成大 QMT 的 70-75；ETF 期权
+  50-59、期货 0-15、可转债转股/回售 80-83（普通户 80/81，信用户 82/83）原样透传）。有方向的类型不用传 `action`，桥按类型定；**直接还款（32/45）、
+  行权/锁定（56-59）没有买卖方向**，也不用传（#314）——记账方向记 `SELL`，`passorder` 收到的仍
+  是原始 opType。归还融资按 MiniQMT 写法：`order_stock(acc, 任一代码占位, CREDIT_DIRECT_CASH_REPAY,
+  还款金额, FIX_PRICE, 0, strategy, remark)`——**金额走 `order_volume`（整数元），`price` 被
+  passorder 忽略**（#330：把金额放 price、volume 传可用资金，还的是 volume 那个数）。直接还款
+  在委托列表里通常**没有行**，结算到期查不到不算失败：`order_sys_id` 为 None、不设
+  `server_error`，`order_stock` 返回 -1 且不抛，`message` 提示用 `query_credit_detail` 核对。
+- **`wait_settlement=False`**（`order_stock_async` 用）：立即回复，但服务端仍以影子结算盯到期限；
+  到期委托列表里没有这张单就推一条 `order_error`（`source="settlement"`）——终端在下单前拦下的
+  单（资金不足弹窗）只有这一条信号（#345）。
 - **期限**：信封里的 `timeout_seconds`（客户端 `call` 自动带上）是调用方等多久。服务端按自己
   收到请求的时刻计龄，轮到执行时已过期限（留 1s 余量，最多期限的 1/4）的下单请求**拒绝
   而不执行**，`error` 以 `RequestExpired` 开头并明确写「没下单」（#303）。下单在 QMT 策略

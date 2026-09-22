@@ -64,7 +64,7 @@ python -m bigqmt_signal_trader.init_config
 
 几个不问、直接定死的：
 
-- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）——选反了差 4~37 倍
+- **`rpc_background_threads` 一律 `False`**（adjust 线程 drain）——后台线程模式每次跨线程交接付一个 tick，redis 也不例外（#343）
 - **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
@@ -274,7 +274,7 @@ seq = xt_trader.order_stock_async(acc, "600654.SH", 23, 100, 11, 2.95, "rpc_test
 | `on_order_stock_async_response(seq, resp)` | 异步下单提交成功 | ✅（实盘）|
 | `on_stock_order(order)` | 委托状态变化（已报 50 / 已成 56 / 废单 57）| ✅（实盘）|
 | `on_stock_trade(trade)` | 成交回报 | ✅ |
-| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）| ✅（实盘）|
+| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）；**终端在下单前就拦下的单**（资金/仓位不足、价格越界、无权限——终端弹窗、不建委托记录、没有任何回调）由服务端结算到期查不到时补推，`error_msg` 以 `passorder submitted but order not found in system` 开头，`source="settlement"`（#345 起）| ✅（实盘）/ 补推未实测 |
 | `on_cancel_error(err)` | 撤单失败 | ✅ |
 | `on_cancel_order_stock_async_response` | 异步撤单回报 | ✅ |
 
@@ -373,6 +373,16 @@ xtdata.unsubscribe_quote(seq)
 
 **验证**：实盘交易日验证 1/20/50/100 只标的，3s 推送节奏稳定，零丢失零乱序；多客户端共享/退订隔离/同客户端多 sub_id 全过；服务端重启恢复（42s 中断后验证两次）。另在完整大 QMT 2.1.19.0 盘中验证显式 `.SHO` 快照、500ms 实时推送及 ETF+期权混合组合。详见 [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) 和 [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md)。
 
+### 多个客户端同时用一座桥
+
+可以，redis 模式天然支持多消费者，三条通道各自的机制：
+
+| 通道 | 多客户端怎么工作 | 注意 |
+|---|---|---|
+| **RPC 查询**（行情快照、持仓、委托、下单） | 每个请求带自己的 `request_id`，回复写到 `bigqmt:rpc:resp:<账号>:<request_id>`，互不串。N 个进程同时 `query_stock_positions` / `get_full_tick` 都行 | **吞吐是共享的**：服务端串行处理（交易类查询排在 adjust 线程上一次一个），谁都不排队的前提是总量不大。多个消费者各自每秒拉一次全市场 `get_full_tick(["SH"])`（~1s 一次）会互相拖慢；这种让一个进程拉、其余订阅它，或开 `full_tick_cache` |
+| **全推行情**（`subscribe_whole_quote`） | 服务端按 `(client_id, sub_id)` 引用计数，同一组合只在 QMT 订一次；推送走 redis pub/sub，**订同一 topic 的所有客户端都收到**；最后一个退订才真退 | 0.3.49 前同机多进程有坑：`client_id` 默认是每用户一份持久化文件，两个进程共用它、`sub_id` 又都从 1 数起，服务端看成一个订阅者，B 退订会把 A 的也拆掉。现在 `sub_id` 带进程号，不再撞；**跨机器**共用同一份配置时仍请各设 `BIGQMT_QUOTE_CLIENT_ID` |
+| **委托/成交回报**（`on_stock_order` 等） | redis stream + pub/sub 按账号广播，每个客户端各起自己的监听线程，都收到全量事件 | 事件是按账号而不是按客户端的：A 下的单 B 也会收到回报，按 `order_remark` / `strategy_name` 自己过滤 |
+
 ### 全市场快照的品种过滤（`types`）
 
 **市场令牌返回的是交易所挂牌的全部标的，股票只占一小部分。** 实测上交所 `"SH"` 共 **26744** 个标的，其中股票 **2315 只（8.7%）**，其余是债券（36%）、回购等。QMT 的耗时严格线性、约 **0.29ms/只**，所以全量要 7.4s，只取股票 0.9s。
@@ -400,7 +410,7 @@ xtdata.get_full_tick(["600000.SH"])               # 显式代码不受影响
 | `etf` | 沪深ETF | 1696 |
 | `fund` | 沪深基金 | 2249 |
 | `index` | 沪深指数 | 609 |
-| `convertible` | 沪深转债 | 320 |
+| `convertible`（别名 `cbond` / `cb`） | 沪深转债 | 320 |
 | `all` | 不收窄，返回交易所全部标的 | 26744（SH） |
 
 **关键在于请求时就收窄，而不是拿回来再过滤**——事后过滤仍要付 QMT 对每个多余标的的 0.29ms。板块清单由 FormulaServer 直连提供（实测 13ms）并按运行缓存，相对省下的时间可以忽略。
@@ -565,33 +575,67 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 
 ### 可插拔传输层
 
-实测（2026-09-08 盘中，同一台实盘终端，`schedule_adjust_interval:
-"100nMilliSecond"`）。方法覆盖 **100 个只读接口**，每个跑 5 次取中位，再对全部
-方法取分位——不是挑一两个快的报数：
+**决定延迟的是线程模式，不是传输。** 2026-09-22 在同一台实盘终端（0.3.53，
+`schedule_adjust_interval: "100nMilliSecond"`）把四种组合各重启一次，**等日志 cadence 回到
+`ticks≈100`**（回放窗口结束）再测，同一组只读探针各跑 20 轮、**轮间隔随机抖动**，
+min / **median** / max（ms）：
 
-| 传输 + 模式 | 延迟 p50 | p90 | 跨机 | 适用场景 |
-|------|---------|-----|------|---------|
-| **redis + 后台线程**（默认）| **3.4ms** | 25.2ms | ✅ | 生产默认，最快 |
-| **zmq + drain** | 15.8ms | 94.7ms | ✅ | 无 redis 时的首选 |
-| redis + drain | 30.7ms | 93.4ms | ✅ | 不推荐，比默认慢 9 倍 |
-| **pipe + drain** | 94.4ms | 95.6ms | ❌ | 白名单拒 socket 时唯一可用 |
-| pipe + 后台线程 | 189.0ms | 296.8ms | ❌ | 不推荐 |
-| zmq + 后台线程 | 592.9ms | 697.5ms | ✅ | 旧默认，**不要用** |
-| **mysql** | ~105ms | — | ✅ | 兼容兜底 |
-| **shm** | — | — | ❌ | 接口预留（未实现）|
+| 方法 | redis + drain | zmq + drain | redis + 后台线程 | zmq + 后台线程 |
+|---|---|---|---|---|
+| ping | 16 / **41** / 99 | 8 / **42** / 98 | 7 / **36** / 106 | 5 / **150** / 285 |
+| get_full_tick（1 只） | 21 / **73** / 118 | 4 / **48** / 102 | 6 / **37** / 93 | 109 / **149** / 198 |
+| get_instrument_detail | 25 / **55** / 115 | 5 / **52** / 100 | 9 / **47** / 88 | 84 / **149** / 270 |
+| get_market_data_ex（1d×5）| 22 / **75** / 118 | 10 / **72** / 113 | 7 / **50** / 110 | 108 / **147** / 290 |
+| **query_stock_positions** | 20 / **70** / 121 | 5 / **51** / 97 | 74 / **143** / 199 | 218 / **456** / 573 |
+| **query_stock_orders** | 27 / **83** / 122 | 2 / **35** / 93 | 105 / **157** / 198 | 168 / **444** / 568 |
+| get_full_tick（"SH" 令牌）| 149 / **203** / 268 | 203 / **231** / 294 | 168 / **297** / 429 | 623 / **713** / 1536 |
+| get_market_data_ex（1m 三周窗口）| 58 / **113** / 166 | 32 / **68** / 160 | 39 / **165** / 278 | 123 / **370** / 474 |
 
-**同一个传输配错模式，差 4~37 倍**——这比选哪个传输更要紧：
+- **drain**（`rpc_background_threads: False`）：adjust 线程自己收 / 处理 / 发，分布是
+  **0–1 拍均匀、中位约半拍**（35–85ms），max 封在一拍多一点。redis 和 zmq 没有可感知差别。
+- **后台线程**（`True`）：收包线程每拿一次 GIL 就付约一个 tick。redis 的只读已被 #344
+  （回包合成一次 pipeline）追平到 36–50ms，但**交易查询仍多一拍**（143–157ms），重读也
+  更贵（后台线程模式下没有重读工作线程）。**zmq + 后台线程是唯一该避开的**：交易查询
+  约 5 拍（444–456ms），全市场快照 713ms。
+- **重读走工作线程**（0.3.53）：读本身短的（1m 窗口，12–19ms）在同一拍内就答完，不额外
+  付拍；只有读本身超过一拍的（全市场快照）才溢出到下一拍。
 
-```
-zmq    592.9ms -> 15.8ms   （drain 快 37 倍）
-pipe   189.0ms -> 94.4ms   （drain 快 2 倍）
-redis    3.4ms -> 30.7ms   （drain 反而慢 9 倍）
-```
+> 自己复测请注意两件事，都是踩过的坑：**等 cadence 回到 `ticks≈100` 再测**（重启后的回放
+> 窗口里 adjust 每秒几千拍，什么都是毫秒级），**轮间隔要随机抖动**（固定 0.3s 正好是 3 拍，
+> 会把每一轮锁死在同一相位，中位数变成第一次调用撞上什么相位的产物）。详见
+> [docs/LATENCY_REPORT.md](docs/LATENCY_REPORT.md) 的方法论。
 
-`rpc_background_threads` 控制这个开关。**redis 是唯一后台线程更快的**：它的
-`brpop` 阻塞唤醒是即时的，而 zmq / pipe 的后台线程都要付跨线程 GIL 交接的
-代价（每次交接约一个 adjust tick）。默认值已经按传输分别选对，没有特别理由
-不要改。
+所以 **`rpc_background_threads` 一律 `False`**，redis 也是。0.3.28 那张「redis + 后台线程
+3.4ms 最快」的表是真的测出来的，但测在**重启后的回放窗口**里：策略一启动 QMT 先回放历史
+K 线，adjust 跟着每根 K 线跑（日志 `adjust cadence: ticks=51429 ... over 10s`，每秒 5000 拍），
+那几十秒里什么 RPC 都是毫秒级；回放完 `run_time` 才是 10Hz。稳态下只读两种模式同档，
+交易查询 drain 稳赢一拍（上表）。0.3.46 及之前
+后台线程模式下 adjust 每拍还会 LPOP 一次，后台线程忙着等 GIL 时请求被 adjust 拿走一拍答完，
+所以体感是 ~100ms 和 500–900ms 混着来；#321 关掉那次 LPOP 后全是 500–900ms（#351 说的
+「变慢」就是这个），drain 则是全部一拍。`bigqmt-init` 从 0.3.51 起对所有传输都写 `False`；
+**旧配置里显式写着 `True` 的不会自动切，改成 `False` 重启一次。**
+自己测延迟先看日志 cadence 回到 `ticks=100` 再测。
+
+**重读少占策略拍（0.3.53，#351）。** drain 把所有请求放到 adjust 线程上跑，一次 1.8s 的
+`get_market_data_ex` 就是你策略自己的 `tick_app` 停 1.8s——这正是 #321 当初把 LPOP 从 adjust
+上拿掉的原因。现在重的读请求交给一条工作线程，回包由 adjust 在下一拍发出：按方法
+（`get_financial_data`、`call_formula` 等）或按大小（市场令牌的 `get_full_tick`、超过 20 个代码、
+`period="tick"`、按日期窗口取 K 线）判定。重读往返多付 1~2 拍；单只 `get_full_tick`、最近 N 根
+K 线这类轻读和所有交易查询照旧一拍。
+实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
+全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口
+~500ms，拍 0.100 / 0.27–0.29s；`get_financial_data` 10 只 3 表 ~2.1s，拍 0.100 / ~0.5s——QMT 的
+C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到一段。`download_history_data2` 5 只 ~1.2s
+整段持 GIL，拍 0.56–0.63 / 1.3–1.5s，工作线程帮不上、回包还多付一两拍，所以 `download_*` 不列入，
+照旧 adjust 线程。
+`rpc_heavy_offload: False` 关掉，`rpc_heavy_codes_threshold` 调阈值；`probe_capabilities` 的
+`thread_routing.heavy_sample` 报每类走哪边。
+
+传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
+zmq 同机免 Redis；pipe 白名单拒 socket 时唯一可用（跨机 ❌）；mysql 兼容兜底；shm 预留。
+**pipe / mysql 没有推送通道**：`on_stock_order` / `on_stock_trade` / `on_order_error` 一条都到不了
+（只有 redis pub/sub 和 zmq PUB 能推）。那里的 `order_stock_async` 会改成等服务端结算再回
+（调用方照样不阻塞），拒单靠 `server_error` 变成 `on_order_error`；成交要自己 `query_stock_trades`。
 
 六种渠道返回的**数据完全一致**：100 个方法逐项比对结构指纹（字段名 + 嵌套
 形状），零差异；另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis），
@@ -928,35 +972,61 @@ BIGQMT_REDIS_CONFIG = {
 - **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
 - **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
 - **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **zmq 也能跑方式一**（#334 起）。副账号在 zmq 下拿自己的端点：端口按副账号派生，和按该账号配置的 zmq 客户端派生的连接地址一致，host 继承主账号 `bind_address` 的；回报轮询走全推通道的 `exec:*` topic。pipe / mysql / shm 没有按账号的寻址，不支持方式一。
+- **副账号的委托/成交回调靠轮询**（#320 起）。大 QMT 的 `order_callback` / `deal_callback` 只回策略绑定的主账号，副账号的单进程里根本看不到。桥在 adjust 拍上每秒对副账号查一次 `get_trade_detail_data`（ORDER / DEAL），状态有变化就发到该账号自己的 `bigqmt:order_events:<副账号>`——`on_stock_order` / `on_stock_trade` / 废单的 `on_order_error` 都有，延迟约一个轮询间隔（`rpc.secondary_exec_poll_seconds`，默认 1 秒），一个间隔内连跳多个状态只发最后一个；要每个中间状态就用方式二。主账号仍是即时回调。
+- **全推行情推送到每个账号**（#315 起）。推送通道按账号命名（`bigqmt:quote_push:<账号>:<topic>`），此前只发主账号的频道，按副账号配置的客户端「订阅成功但无回调」。现在表里每个账号各发一份，客户端不用改。
 - **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
 
-#### 方式二：多策略实例（不改代码，账号在不同客户端时的唯一选择）
+#### 同一个账号、几种类型：港股通（`BIGQMT_ACCOUNT_TYPE` 写成列表）
 
-为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+港股通不是另一个账号：股票户用**同一个资金账号**做沪港通 / 深港通，但终端把那些持仓、委托、
+成交记在 `get_trade_detail_data(账号, 'HUGANGTONG' | 'SHENGANGTONG', ...)` 下，按 `'STOCK'`
+查不到。`BIGQMT_ACCOUNT_TYPE_MAP` 一个账号只能对一个类型，写不出这件事——所以类型可以是**列表**，
+第一个是默认（0.3.54 起）：
 
 ```python
-# bigqmt_signal_trader_local_config_stock.py  — 股票账号
 BIGQMT_ACCOUNT_ID = "你的股票账号"
-BIGQMT_ACCOUNT_TYPE = "STOCK"
-BIGQMT_REDIS_CONFIG = {
-    "host": "...", "port": 6379, "db": 5, "password": "...",
-    "transport": "redis",          # 或 "zmq"
-    # ...
-}
-
-# bigqmt_signal_trader_local_config_credit.py  — 信用账号
-BIGQMT_ACCOUNT_ID = "你的信用账号"
-BIGQMT_ACCOUNT_TYPE = "CREDIT"
-BIGQMT_REDIS_CONFIG = {
-    "host": "...", "port": 6379, "db": 5, "password": "...",
-    "transport": "redis",
-    # ...
-}
+BIGQMT_ACCOUNT_TYPE = ["STOCK", "HUGANGTONG", "SHENGANGTONG"]   # 方式一的表里也可以：{"账号": ["STOCK", "HUGANGTONG"]}
 ```
 
-然后在 QMT 策略编辑器里加载两个 DRYRUN 文件（每个指向不同的配置），分别运行。两个实例的 RPC channel 自动隔离（按 account_id）。
+客户端照 MiniQMT 的写法，用类型不同的 `StockAccount` 分别查：
 
-> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突。
+```python
+acc    = StockAccount("你的股票账号")                  # A 股
+acc_hk = StockAccount("你的股票账号", "SHENGANGTONG")  # 深港通（沪港通用 "HUGANGTONG"）
+xt_trader.query_stock_positions(acc)      # STOCK 持仓
+xt_trader.query_stock_positions(acc_hk)   # 深港通持仓
+xt_trader.order_stock(acc_hk, "00700.HK", xtconstant.STOCK_BUY, 100, xtconstant.FIX_PRICE, 300.0)
+```
+
+`StockAccount` 的类型随每个交易类请求以 `account_type` 参数传到服务端；在列表里就按它查、按它结算
+（港股通委托的合同编号回填要去 HUGANGTONG 的委托列表里找），不在列表里仍按默认答并记一次日志——部署
+的配置仍然决定这个账号是什么户（#92 那条不变）。`ping` 多报 `account_types`，客户端的「类型不一致」
+告警只在声明的类型不在这张表里时才响。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通
+买卖。撤单也带类型。**没有港股通权限或不用列表的部署，行为零变化。**
+
+#### 方式二：多策略实例（账号在不同 QMT 客户端时的唯一选择）
+
+**适用条件：每个账号登录在各自的 QMT 客户端里**（不同券商、不同机器，或同一台机器上两个安装目录）。每个客户端是一个独立进程，各自有自己的 `python` 目录，所以什么都不用"指向"——每个目录里放一份**同名**的配置文件和一份入口，各写各的账号：
+
+```
+D:\国金证券QMT交易端\python\            ← 客户端 A，登录股票账号
+├── bigqmt_signal_trader/
+├── bigqmt_signal_trader_strategy.py
+├── bigqmt_signal_trader_redis_rpc_runtime.py
+├── BIGQMT_REDIS_DRYRUN.py
+└── bigqmt_signal_trader_local_config.py    BIGQMT_ACCOUNT_ID = "股票账号", BIGQMT_ACCOUNT_TYPE = "STOCK"
+
+E:\华泰QMT\python\                       ← 客户端 B，登录信用账号
+├── （同样 4 项）
+└── bigqmt_signal_trader_local_config.py    BIGQMT_ACCOUNT_ID = "信用账号", BIGQMT_ACCOUNT_TYPE = "CREDIT"
+```
+
+两份配置连同一个 Redis 即可（`host` / `port` / `db` / `password` 相同）。每个客户端在自己的模型交易里加载自己目录下的 `BIGQMT_REDIS_DRYRUN.py`，两个实例的 RPC channel 按 `account_id` 自动隔离（`bigqmt:rpc:queue:<账号>`），互不影响。`bigqmt-init` 在每台/每个目录各跑一遍就是这个结果。
+
+> **同一个 QMT 客户端里跑不了两个实例。** 同一客户端的所有策略共用一个 Python 进程和一份 `sys.modules`，配置模块名 `bigqmt_signal_trader_local_config` 在入口、runtime、strategy 三处写死，第二个实例 import 到的仍是第一份配置——两个实例绑同一个账号，而且都正常启动、不报错。**同一客户端里登录了多个账号，用方式一。**（#261 反馈的"每个指向不同的配置"此前没写清楚：不存在这样的指向，是靠目录隔离。）
+
+> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突；两个客户端在同一台机器上也一样。
 
 **客户端（外部程序）**：为每个账号创建独立的 client/trader 对象。
 
@@ -1034,12 +1104,12 @@ xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符�
 | `get_full_tick(["SH"])` | 全市场 | **默认只取股票**（1.08s）；要全部传 `types=["all"]`（7.4s，含地方债等 26744 只） |
 | `get_instrument_detail()` 查不到 | `None` | `{}`（两者都是 falsy，`if not detail` 通用） |
 | `download_history_data()` | 无返回 | 返回 `{"finished": n, "total": n}`（多给的信息，可忽略） |
-| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 还需服务端 `BIGQMT_ACCOUNT_TYPE = "CREDIT"`，**客户端的类型不会传到服务端** |
+| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 服务端 `BIGQMT_ACCOUNT_TYPE` 决定；客户端的类型会随请求传来，但只在服务端配置（可以是列表，港股通）允许时才生效 |
 | 委托类型常量 | `xtconstant.order_type` | 内部会翻译成 `passorder` 的 opType（两套编号，专项两融 40–45 → 70–75） |
 
 ### 本项目的扩展（MiniQMT 没有）
 
-这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`。
+这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`、`convert_bond()` / `sell_back_bond()`（可转债转股 / 回售，大 QMT passorder opType 80-83，按账户类型自动选普通户/信用户编号；`order_stock` 直接传 80-83 也认）。
 
 ---
 
@@ -1273,7 +1343,7 @@ BIGQMT_REDIS_CONFIG = {
     #   注意 zmq 实测比 redis 慢（ping 95ms vs 10ms，交易查询 95ms vs 4ms），
     #   它的用途是「这台机器没有 redis」，不是低延迟。
     # "transport": "zmq",
-    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils，同样自动开 background_threads。
+    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils。
     # "transport": "mysql",
     # "mysql": {"driver":"pymysql","host":"...","port":3306,"user":"root",
     #           "password":"...","database":"bigqmt_rpc","charset":"utf8mb4"},
@@ -1281,17 +1351,16 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,    # 下单默认关闭
     "rpc_process_in_listener": True,     # 只读请求在收包线程直接处理（低延迟）
     "rpc_listener_methods": ("*",),      # * = 所有只读方法
-    "rpc_background_threads": True,      # redis 用后台收包线程（最快）
+    "rpc_background_threads": False,     # adjust 线程 drain；True 每次跨线程交接付一个 tick（#343）
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> **`rpc_background_threads` 按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
-> redis 用 `True`（3.4ms，`brpop` 唤醒是即时的）；zmq / pipe / mysql 用 `False`
-> 走 adjust drain（zmq 15.8ms），因为它们的后台线程每次都要付跨线程 GIL 交接，
-> 约一个 adjust tick。zmq 配 `True` 是 592.9ms，慢 37 倍。不写这个键则沿用历史
-> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。向导按传输替你定好了。
+> **`rpc_background_threads` 一律 `False`**（实测见上面「可插拔传输层」那张四列表）：
+> drain 模式一个请求最多等一个 adjust tick；后台线程每拿一次 GIL 付一个 tick，redis 回包
+> 8 次往返就是 400ms（#343）。不写这个键，0.3.51 起各传输默认也是 drain；旧配置里写着
+> `True` 的改掉重启。`True` 只留给没有 drain 实现的传输。
 >
 > 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
 > listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。
@@ -1522,20 +1591,24 @@ BIGQMT_REDIS_CONFIG = {
 
 ## 实测延迟对比（真实直连 QMT）
 
-三种传输全部实测，端到端连接真实 QMT 进程，n=15/方法：
+稳态（回放窗口结束、`adjust cadence: ticks=100`）下，2026-09-22 同一台实盘终端，
+`100nMilliSecond`，每种组合重启后等 cadence 回到 10Hz 再测，min / median / max（ms）：
 
-| 传输 | ping p50 | ping p90 | 交易查询 p50 | 串行吞吐（ping / 交易查询）|
-|------|---------|---------|------------|------------------------|
-| **Redis** | **10ms** | 105ms | **4ms** | **20 / 195 次每秒** |
-| **ZMQ**（drain，#183）| 95ms | 110ms | 95ms | 10 / 10 次每秒 |
-| **ZMQ**（后台线程，0.3.21 前的默认）| 405ms | 408ms | 607ms | 2.4 / 1.7 次每秒 |
-| **MySQL** | ~104ms | — | — | — |
+| 传输 + 模式 | ping | query_stock_positions | 说明 |
+|------|------|------|------|
+| **redis + drain**（默认）| 23 / 102 / 106 | 85 / 103 / 109 | 一拍；跨机、回报有 stream 回放 |
+| **zmq + drain** | 10 / 87 / 108 | 8 / 88 / 103 | 一拍；没有 redis 时用 |
+| redis + 后台线程 | 199 / 407 / 605 | 102 / 197 / 320 | 每条 Redis 命令一拍 |
+| zmq + 后台线程 | 98 / 103 / 303 | 396 / 490 / 600 | 交易查询要跨两次线程 |
+| **MySQL** | ~104 | — | 轮询，仅作兜底 |
 
-**生产推荐 Redis**，而且它就是实测最快的那个 —— 早期版本说「ZMQ 理论最快」是错的。
-ZMQ 的 drain 模式被钉在一个 adjust tick（95ms ≈ 100ms tick），因为它每 tick 只轮询
-一次；Redis 的阻塞 `brpop` 是请求一落队列就推回来，不等 tick。并发也只有 Redis 有
-用：ZMQ 客户端整个请求周期持单 socket 锁（#186），4 并发和串行一样快。
-ZMQ 的用途是「这台机器没有 redis」。MySQL 仅作兜底。
+**地板是一个 adjust tick。** drain 下请求等下一拍拾取，串行调用锁相到整拍，所以 median
+≈ 100ms、min 是撞上拍边的运气；并发发请求（`call_async`）一拍最多处理 20 条，平均只等
+半拍。想再低只有缩 `schedule_adjust_interval`（需验证 `run_time` 是否认更小的值）或把
+serving 挪出 QMT 进程。读行情走 FormulaServer 直连 0.07ms，不经过这条链路。
+
+> 0.3.21–0.3.50 的 README 在这里写过「Redis ping 10ms / 交易查询 4ms / 195 次每秒」，那是
+> 在重启后的回放窗口里测的（见上一节），稳态下不存在。
 
 复现基准：
 ```powershell
@@ -1662,6 +1735,8 @@ python test_all_apis.py
 | `RuntimeError: passorder is not available in Big QMT runtime` | QMT 没注入 API 全局 —— 这个文件被当成**普通脚本**执行了 | 加到**模型交易**里运行，别在策略编辑器窗口点运行；检查没勾「独立 python 进程」 |
 | `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
 | `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
+| `直接还款 (order_type 32): the repayment amount goes in order_volume as integer yuan, price is ignored` | 归还融资把金额放在了 `price`（#330）。`passorder` 的直接还款金额走 **volume 槽**，`price` 不看 | `order_stock(acc, code, CREDIT_DIRECT_CASH_REPAY, 还款金额, FIX_PRICE, 0, ...)`，金额整数元 |
+| `server_error: passorder submitted but order not found in system`（运行模式已是实盘） | **终端在下单前拦下了**——资金/仓位不足、价格越界、无权限。终端弹窗、不建委托记录、不发任何回调，这条回复是唯一信号（#345） | 看 QMT 屏幕上的弹窗；异步下单收 `on_order_error`（`source="settlement"`） |
 | `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
 
 **最常见的是第一条。** 一句话确认：
